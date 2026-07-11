@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 import config
 import dexscreener_client as dex
 import filters
+import safety_check
 import storage
 import telegram_notifier as tg
 
@@ -64,7 +65,13 @@ async def _run_cycle() -> None:
             logger.debug("Skipping %s (recently alerted)", addr)
             continue
 
-        ok = await tg.send_alert(result)
+        # Safety check (between scoring and alerting)
+        should_alert, safety_data = safety_check.evaluate_safety(chain, addr)
+        if not should_alert:
+            logger.info("Skipping %s on %s -- failed safety check", addr, chain)
+            continue
+
+        ok = await tg.send_alert(result, safety=safety_data)
         if ok:
             storage.record_alert(chain, addr, result["score"])
             sent += 1
@@ -75,8 +82,8 @@ async def _run_cycle() -> None:
 async def main() -> None:
     _setup_logging()
     logger.info(
-        "Bot starting -- chains=%s, interval=%ds, min_score=%.1f",
-        config.CHAINS, config.POLL_INTERVAL_SECONDS, config.MIN_ALERT_SCORE,
+        "Bot starting -- chains=%s, interval=%ds, safety_skip=%s",
+        config.CHAINS, config.POLL_INTERVAL_SECONDS, config.SKIP_ON_SAFETY_CHECK_FAILURE,
     )
 
     # Periodic old-record cleanup

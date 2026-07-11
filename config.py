@@ -1,7 +1,19 @@
+﻿"""Configuration loader.
+
+Secrets and global settings come from .env.
+Per-chain filter/scoring/safety thresholds come from chain_config.yaml.
+"""
+
+import logging
 import os
+from pathlib import Path
+from typing import Any
+
+import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 
 def _float(key: str, default: float) -> float:
@@ -12,35 +24,86 @@ def _int(key: str, default: int) -> int:
     return int(os.getenv(key, str(default)))
 
 
-# Telegram
+# -- Secrets & global settings (from .env) ----------------------------
+
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Chains
 CHAINS: list[str] = [
     c.strip().lower() for c in os.getenv("CHAINS", "solana,base").split(",") if c.strip()
 ]
 
-# Polling
 POLL_INTERVAL_SECONDS: int = _int("POLL_INTERVAL_SECONDS", 180)
-
-# Filter thresholds
-MIN_LIQUIDITY_USD: float = _float("MIN_LIQUIDITY_USD", 5000)
-MAX_LIQUIDITY_USD: float = _float("MAX_LIQUIDITY_USD", 50000)
-MAX_MARKET_CAP: float = _float("MAX_MARKET_CAP", 500000)
-MAX_PAIR_AGE_HOURS: float = _float("MAX_PAIR_AGE_HOURS", 168)
-MIN_VOLUME_LIQUIDITY_RATIO: float = _float("MIN_VOLUME_LIQUIDITY_RATIO", 0.5)
-MIN_TX_COUNT_1H: int = _int("MIN_TX_COUNT_1H", 10)
-MIN_PRICE_CHANGE_1H: float = _float("MIN_PRICE_CHANGE_1H", 0.0)
-MIN_PRICE_CHANGE_6H: float = _float("MIN_PRICE_CHANGE_6H", 0.0)
-
-# Dedup
 DEDUP_COOLDOWN_HOURS: float = _float("DEDUP_COOLDOWN_HOURS", 6)
+SAFETY_CHECK_CACHE_HOURS: float = _float("SAFETY_CHECK_CACHE_HOURS", 1)
+SKIP_ON_SAFETY_CHECK_FAILURE: bool = os.getenv("SKIP_ON_SAFETY_CHECK_FAILURE", "true").lower() in ("1", "true", "yes")
 
-# Scoring
-MIN_ALERT_SCORE: float = _float("MIN_ALERT_SCORE", 50)
-
-# Logging
 LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")
 LOG_MAX_BYTES: int = _int("LOG_MAX_BYTES", 5_242_880)
 LOG_BACKUP_COUNT: int = _int("LOG_BACKUP_COUNT", 3)
+
+
+# -- Per-chain config (from chain_config.yaml) ------------------------
+
+_CONFIG_PATH = Path(__file__).parent / "chain_config.yaml"
+
+_DEFAULT_PROFILE: dict[str, Any] = {
+    "min_liquidity_usd": 5000,
+    "max_liquidity_usd": 50000,
+    "max_market_cap": 500000,
+    "max_pair_age_hours": 168,
+    "min_volume_liquidity_ratio": 0.5,
+    "min_price_change_1h": 0.0,
+    "min_price_change_6h": 0.0,
+    "min_buy_sell_ratio": 1.0,
+    "min_txns_1h": 10,
+    "min_alert_score": 50,
+    "weights": {
+        "liquidity": 15,
+        "market_cap": 15,
+        "pair_age": 10,
+        "vol_liq_ratio": 20,
+        "price_change": 20,
+        "buy_sell_ratio": 20,
+    },
+    "safety": {
+        "max_buy_tax_pct": 10,
+        "max_sell_tax_pct": 10,
+        "max_top10_holder_pct": 70,
+        "reject_honeypot": True,
+        "reject_mint_authority": True,
+        "reject_blacklist": True,
+    },
+}
+
+
+def _load_chain_configs() -> dict[str, dict[str, Any]]:
+    """Load chain_config.yaml and return a dict keyed by chain name."""
+    if not _CONFIG_PATH.exists():
+        logger.warning("chain_config.yaml not found at %s -- using built-in defaults", _CONFIG_PATH)
+        return {"default": _DEFAULT_PROFILE}
+
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    if not isinstance(raw, dict):
+        logger.error("chain_config.yaml is not a valid mapping -- using defaults")
+        return {"default": _DEFAULT_PROFILE}
+
+    return raw
+
+
+CHAIN_CONFIGS: dict[str, dict[str, Any]] = _load_chain_configs()
+
+
+def get_chain_profile(chain_id: str) -> dict[str, Any]:
+    """Return the config profile for a chain, falling back to 'default'."""
+    chain = chain_id.lower()
+    if chain in CHAIN_CONFIGS:
+        return CHAIN_CONFIGS[chain]
+    if "default" in CHAIN_CONFIGS:
+        logger.warning("No config profile for chain '%s' -- using default", chain)
+        return CHAIN_CONFIGS["default"]
+    logger.warning("No config profile for chain '%s' and no default -- using built-in", chain)
+    return _DEFAULT_PROFILE
+
