@@ -3,6 +3,7 @@
 # Any chain in CHAINS (.env) without an entry here will use "default".
 
 default:
+  poll_interval_seconds: 180
   min_liquidity_usd: 5000
   max_liquidity_usd: 50000
   max_market_cap: 500000
@@ -31,6 +32,7 @@ default:
     reject_blacklist: true
 
 solana:
+  poll_interval_seconds: 180
   min_liquidity_usd: 5000
   max_liquidity_usd: 50000
   max_market_cap: 500000
@@ -59,6 +61,7 @@ solana:
     reject_blacklist: true
 
 robinhood:
+  poll_interval_seconds: 75
   min_market_cap: 5000
   max_market_cap: 10000
   min_liquidity_usd: 3000
