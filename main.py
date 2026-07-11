@@ -14,6 +14,7 @@ import config
 import dexscreener_client as dex
 import filters
 import performance_tracker
+import pool_listener
 import rugcheck
 import safety_check
 import startup_check
@@ -214,6 +215,62 @@ async def _run_chain_cycle(chain_id: str) -> None:
     logger.info("[%s] Cycle done -- %d alerts sent", chain_id, sent)
 
 
+# -- Real-time pool listener (QuickNode websocket) --
+
+async def _handle_new_pool(token_info: dict) -> None:
+    """Handle a newly detected pool from the websocket listener.
+    
+    Fast-path: minimal checks, alert immediately for brand-new pools.
+    """
+    token_address = token_info["token_address"]
+    chain_id = token_info["chain_id"]
+    sol_deposited = token_info.get("sol_deposited", 0)
+
+    # Dedup: don't alert if we've seen this token before
+    if storage.was_recently_alerted(chain_id, token_address):
+        return
+
+    # Also skip if already tracked in metrics (DexScreener scanner saw it)
+    prev = storage.get_previous_metrics(token_address, chain_id)
+    if prev is not None:
+        return
+
+    # RugCheck (quick summary call)
+    rc_pass, rc_data = rugcheck.evaluate_rugcheck(token_address, chain_id)
+    if not rc_pass:
+        logger.info("[WS] %s failed RugCheck -- skipping", token_address[:16])
+        return
+
+    # Build a minimal alert result
+    latency = time.time() - token_info.get("detected_at", time.time())
+    result = {
+        "score": 0,  # No score yet -- this is a speed play
+        "momentum_realert": False,
+        "prev_score": 0,
+        "pair": {
+            "chainId": "solana",
+            "baseToken": {"address": token_address, "name": "New Pool", "symbol": "???"},
+            "pairAddress": "",
+            "liquidity": {"usd": sol_deposited * 170},  # rough SOL->USD estimate
+            "marketCap": 0,
+            "volume": {"h24": 0},
+            "priceChange": {},
+            "txns": {"h1": {"buys": 0, "sells": 0}},
+            "priceUsd": "0",
+        },
+        "is_new_pool": True,
+        "sol_deposited": sol_deposited,
+        "detection_latency_s": round(latency, 1),
+    }
+
+    # Send alert
+    ok = await tg.send_new_pool_alert(token_info, rc_data)
+    if ok:
+        storage.record_alert(chain_id, token_address, 0)
+        logger.info("[WS] Alert sent for new pool: %s (%.1f SOL, latency=%.1fs)",
+                    token_address[:16], sol_deposited, latency)
+
+
 # -- Background tasks (independent of per-chain scheduling) --
 
 async def _snapshot_loop() -> None:
@@ -295,6 +352,14 @@ async def main() -> None:
     asyncio.create_task(_snapshot_loop())
     asyncio.create_task(_status_log_loop())
     asyncio.create_task(_cleanup_loop())
+
+    # Start real-time pool listener (QuickNode websocket) if configured
+    if config.QUICKNODE_WSS_URL:
+        listener = pool_listener.PoolListener(on_new_pool=_handle_new_pool)
+        asyncio.create_task(listener.start())
+        logger.info("[WS] Real-time pool listener started (Pump.fun + Raydium)")
+    else:
+        logger.warning("[WS] QUICKNODE_WSS_URL not set -- real-time pool detection disabled")
 
     # Keep the event loop alive
     try:

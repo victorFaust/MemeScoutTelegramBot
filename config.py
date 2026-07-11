@@ -38,6 +38,9 @@ DEDUP_COOLDOWN_HOURS: float = _float("DEDUP_COOLDOWN_HOURS", 6)
 SAFETY_CHECK_CACHE_HOURS: float = _float("SAFETY_CHECK_CACHE_HOURS", 1)
 SKIP_ON_SAFETY_CHECK_FAILURE: bool = os.getenv("SKIP_ON_SAFETY_CHECK_FAILURE", "true").lower() in ("1", "true", "yes")
 
+# QuickNode Solana websocket
+QUICKNODE_WSS_URL: str = os.getenv("QUICKNODE_WSS_URL", "")
+
 LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")
 LOG_MAX_BYTES: int = _int("LOG_MAX_BYTES", 5_242_880)
 LOG_BACKUP_COUNT: int = _int("LOG_BACKUP_COUNT", 3)
