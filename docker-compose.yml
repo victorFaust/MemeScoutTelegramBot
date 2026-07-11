@@ -1,0 +1,8 @@
+services:
+  memecoin-bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./alerts.db:/app/alerts.db

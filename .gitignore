@@ -1,0 +1,10 @@
+.env
+alerts.db
+alerts.db-wal
+alerts.db-shm
+bot.log
+bot.log.*
+__pycache__/
+*.pyc
+.venv/
+venv/
