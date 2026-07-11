@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 import config
 import dexscreener_client as dex
 import filters
+import performance_tracker
 import safety_check
 import storage
 import telegram_notifier as tg
@@ -74,6 +75,26 @@ async def _run_cycle() -> None:
         ok = await tg.send_alert(result, safety=safety_data)
         if ok:
             storage.record_alert(chain, addr, result["score"])
+            # Record outcome for performance tracking
+            pair_address = pair.get("pairAddress", "")
+            token_symbol = base.get("symbol", "?")
+            price_usd = None
+            try:
+                price_usd = float(pair.get("priceUsd", 0))
+            except (ValueError, TypeError):
+                pass
+            liq = (pair.get("liquidity") or {}).get("usd")
+            mc = pair.get("marketCap") or pair.get("fdv")
+            storage.record_outcome(
+                token_address=addr,
+                chain_id=chain,
+                pair_address=pair_address,
+                token_symbol=token_symbol,
+                score=result["score"],
+                price=price_usd,
+                liquidity=liq,
+                market_cap=mc,
+            )
             sent += 1
 
     logger.info("Cycle done -- %d alerts sent", sent)
@@ -89,6 +110,9 @@ async def main() -> None:
     # Periodic old-record cleanup
     last_cleanup = 0.0
 
+    # Start background snapshot tracker
+    asyncio.create_task(_snapshot_loop())
+
     while True:
         try:
             await _run_cycle()
@@ -102,6 +126,20 @@ async def main() -> None:
 
         logger.info("Sleeping %ds until next cycle...", config.POLL_INTERVAL_SECONDS)
         await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+
+
+async def _snapshot_loop() -> None:
+    """Independent background loop for performance snapshot checks."""
+    snapshot_interval = 300  # 5 minutes
+    logger.info("Snapshot tracker started (interval=%ds)", snapshot_interval)
+    while True:
+        await asyncio.sleep(snapshot_interval)
+        try:
+            stats = performance_tracker.run_snapshot_check()
+            if stats["updated"] or stats["rugged"]:
+                logger.info("Snapshot results: %s", stats)
+        except Exception:
+            logger.exception("Error in snapshot tracker")
 
 
 if __name__ == "__main__":

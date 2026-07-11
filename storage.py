@@ -29,6 +29,29 @@ CREATE TABLE IF NOT EXISTS safety_cache (
     result_json   TEXT NOT NULL,
     PRIMARY KEY (token_address, chain_id)
 );
+
+CREATE TABLE IF NOT EXISTS alert_outcomes (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_address       TEXT NOT NULL,
+    chain_id            TEXT NOT NULL,
+    pair_address        TEXT NOT NULL,
+    token_symbol        TEXT,
+    alerted_at          REAL NOT NULL,
+    score_at_alert      REAL NOT NULL,
+    price_at_alert      REAL,
+    liquidity_at_alert  REAL,
+    market_cap_at_alert REAL,
+    price_15m           REAL,
+    price_1h            REAL,
+    price_6h            REAL,
+    price_24h           REAL,
+    max_price_24h       REAL,
+    checked_15m         INTEGER DEFAULT 0,
+    checked_1h          INTEGER DEFAULT 0,
+    checked_6h          INTEGER DEFAULT 0,
+    checked_24h         INTEGER DEFAULT 0,
+    rugged              INTEGER DEFAULT 0
+);
 """
 
 
@@ -117,5 +140,98 @@ def cache_safety_check(chain_id: str, token_address: str, result: dict[str, Any]
             (token_address, chain_id, time.time(), json.dumps(result)),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+# -- Alert outcomes (performance tracking) --
+
+def record_outcome(
+    token_address: str,
+    chain_id: str,
+    pair_address: str,
+    token_symbol: str,
+    score: float,
+    price: float | None,
+    liquidity: float | None,
+    market_cap: float | None,
+) -> None:
+    """Record an alert outcome row when an alert is sent."""
+    conn = _connect()
+    try:
+        conn.execute(
+            """INSERT INTO alert_outcomes
+               (token_address, chain_id, pair_address, token_symbol, alerted_at,
+                score_at_alert, price_at_alert, liquidity_at_alert, market_cap_at_alert)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (token_address, chain_id, pair_address, token_symbol, time.time(),
+             score, price, liquidity, market_cap),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_snapshots() -> list[dict]:
+    """Get outcome rows that have unchecked snapshots due."""
+    now = time.time()
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """SELECT * FROM alert_outcomes
+               WHERE (checked_24h = 0 AND rugged = 0)
+               ORDER BY alerted_at ASC""",
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_snapshot(
+    row_id: int,
+    window: str,
+    price: float | None,
+    rugged: bool = False,
+    max_price_24h: float | None = None,
+) -> None:
+    """Update a specific snapshot window for an outcome row."""
+    conn = _connect()
+    try:
+        if rugged:
+            conn.execute(
+                "UPDATE alert_outcomes SET rugged = 1 WHERE id = ?", (row_id,)
+            )
+        elif price is not None:
+            price_col = f"price_{window}"
+            checked_col = f"checked_{window}"
+            # Update price and checked flag
+            conn.execute(
+                f"UPDATE alert_outcomes SET {price_col} = ?, {checked_col} = 1 WHERE id = ?",
+                (price, row_id),
+            )
+            # Update max_price_24h if applicable
+            if max_price_24h is not None:
+                conn.execute(
+                    """UPDATE alert_outcomes SET max_price_24h = ?
+                       WHERE id = ? AND (max_price_24h IS NULL OR max_price_24h < ?)""",
+                    (max_price_24h, row_id, max_price_24h),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_outcomes_for_report(days: int = 7) -> list[dict]:
+    """Get all outcome rows from the last N days for reporting."""
+    cutoff = time.time() - days * 86400
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM alert_outcomes WHERE alerted_at > ? ORDER BY alerted_at DESC",
+            (cutoff,),
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
