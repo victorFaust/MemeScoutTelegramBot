@@ -148,6 +148,9 @@ def build_message(result: dict, safety: dict | None = None) -> str:
             holders_min = safety.get("holder_count_min", 0)
             lines.append(f"Holders: {holders_min}+ | Top wallet: {top1:.0f}%")
             lines.append(f"Unique buyers: {unique_buyers} (quality: {quality:.0%})")
+            creates = safety.get("creator_token_creates")
+            if creates is not None:
+                lines.append(f"Creator: {creates} tokens deployed")
 
     lines.append("")
     lines.append(f"Score: *{score}/100*")

@@ -181,22 +181,122 @@ def get_unique_buyers_recent(token_mint: str, limit: int = 20) -> dict | None:
 
 
 def get_creator_history(creator_wallet: str) -> dict | None:
-    """Check how many tokens a creator has deployed recently.
+    """Check deployer wallet for serial token creation.
     
-    Serial deployers (5+ tokens in a week) are high rug risk.
+    Serial deployers (5+ tokens recently) are high rug risk.
+    Looks at recent transactions for token creation program interactions.
     """
-    # Get recent transactions from creator
+    # Check cache first
+    cache_key = f"creator:{creator_wallet}"
+    cached = storage.get_cached_safety_check("solana", cache_key)
+    if cached is not None:
+        return cached
+
     sigs_result = _rpc_call("getSignaturesForAddress", [
         creator_wallet,
-        {"limit": 50, "commitment": "confirmed"}
+        {"limit": 100, "commitment": "confirmed"}
     ])
     if sigs_result is None:
         return None
-    
-    # Count is a rough proxy — serial deployers have many recent txs
-    return {
-        "recent_tx_count": len(sigs_result) if sigs_result else 0,
+
+    if not sigs_result:
+        result = {"recent_tx_count": 0, "token_creates": 0, "is_serial_deployer": False}
+        storage.cache_safety_check("solana", cache_key, result)
+        return result
+
+    # Count how many of these transactions involve token creation programs
+    # We check a subset of recent txs for program interactions with Pump.fun or token mint
+    token_creates = 0
+    checked = 0
+    one_week_ago = time.time() - 7 * 86400
+
+    for sig_info in sigs_result[:30]:  # Check up to 30 recent txs
+        # Filter by time — only count last 7 days
+        block_time = sig_info.get("blockTime", 0)
+        if block_time and block_time < one_week_ago:
+            break
+
+        sig = sig_info.get("signature")
+        if not sig:
+            continue
+
+        # Fetch transaction to check if it's a token creation
+        tx_result = _rpc_call("getTransaction", [
+            sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+        ])
+        if tx_result is None:
+            continue
+
+        checked += 1
+        message = tx_result.get("transaction", {}).get("message", {})
+        instructions = message.get("instructions", [])
+
+        # Check if any instruction interacts with token creation programs
+        for ix in instructions:
+            program_id = ix.get("programId", "")
+            parsed = ix.get("parsed", {})
+            ix_type = parsed.get("type", "") if isinstance(parsed, dict) else ""
+
+            if program_id == "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P":
+                # Pump.fun interaction — likely a token launch
+                token_creates += 1
+                break
+            elif ix_type in ("initializeMint", "initializeMint2"):
+                token_creates += 1
+                break
+
+        # Stop early if we've confirmed serial deployer
+        if token_creates >= 5:
+            break
+
+    is_serial = token_creates >= 5
+    result = {
+        "recent_tx_count": len(sigs_result),
+        "token_creates": token_creates,
+        "txs_checked": checked,
+        "is_serial_deployer": is_serial,
     }
+
+    # Cache for 6 hours (creator history doesn't change fast)
+    storage.cache_safety_check("solana", cache_key, result)
+    if is_serial:
+        logger.info("Serial deployer detected: %s (%d token creates in recent txs)",
+                    creator_wallet[:16], token_creates)
+    return result
+
+
+def get_token_creator(token_mint: str) -> str | None:
+    """Get the creator/deployer wallet for a token mint.
+    Uses getSignaturesForAddress on the mint to find the first transaction (creation)."""
+    sigs_result = _rpc_call("getSignaturesForAddress", [
+        token_mint,
+        {"limit": 1, "before": None, "commitment": "confirmed"}
+    ])
+    # The last signature is the oldest (creation tx)
+    # Actually getSignaturesForAddress returns newest first, so we need the full list
+    # For efficiency, just get the account info which has the owner
+    account_result = _rpc_call("getAccountInfo", [
+        token_mint,
+        {"encoding": "jsonParsed"}
+    ])
+    if account_result is None:
+        return None
+
+    value = account_result.get("value")
+    if not value:
+        return None
+
+    # For SPL tokens, the mint authority or update authority is often the creator
+    data = value.get("data", {})
+    if isinstance(data, dict):
+        parsed = data.get("parsed", {})
+        info = parsed.get("info", {})
+        # mintAuthority is often the creator (before they renounce)
+        authority = info.get("mintAuthority") or info.get("updateAuthority")
+        if authority:
+            return authority
+
+    return None
 
 
 def analyze_token(token_mint: str) -> dict[str, Any] | None:
@@ -224,10 +324,18 @@ def analyze_token(token_mint: str) -> dict[str, Any] | None:
     buyers = get_unique_buyers_recent(token_mint, limit=10)
     if buyers:
         result.update(buyers)
-        # Compute buy quality: unique_buyers / total_txns
         total = buyers.get("total_txns", 0)
         unique = buyers.get("unique_buyers", 0)
         result["buy_quality"] = round(unique / total, 2) if total > 0 else 0
+
+    # Creator/deployer history check
+    creator = get_token_creator(token_mint)
+    if creator:
+        result["creator_wallet"] = creator[:16] + "..."
+        creator_data = get_creator_history(creator)
+        if creator_data:
+            result["creator_token_creates"] = creator_data.get("token_creates", 0)
+            result["is_serial_deployer"] = creator_data.get("is_serial_deployer", False)
 
     # Cache for 1 hour
     storage.cache_safety_check("solana", cache_key, result)
@@ -244,6 +352,12 @@ def passes_holder_checks(token_mint: str, cfg: dict) -> tuple[bool, dict | None]
     if analysis is None:
         # RPC unavailable — pass through (don't block)
         return True, None
+
+    # Check serial deployer (reject if creator has launched 5+ tokens recently)
+    if analysis.get("is_serial_deployer", False) and cfg.get("reject_serial_deployers", True):
+        logger.info("Holder check REJECT %s: serial deployer (%d token creates)",
+                    token_mint[:16], analysis.get("creator_token_creates", 0))
+        return False, analysis
 
     # Check top holder concentration
     max_top1 = cfg.get("max_top1_holder_pct", 30)
