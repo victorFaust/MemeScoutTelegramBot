@@ -2,10 +2,12 @@
 
 Every pair is scored 0-100. Sub-scores are weighted per the chain profile.
 Thresholds are loaded per-chain from chain_config.yaml via config.get_chain_profile().
+Includes velocity tracking (is momentum accelerating?) and time-of-day boost.
 """
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import config
@@ -116,6 +118,47 @@ def _score_buy_sell_ratio(pair: dict, cfg: dict) -> float:
     return max(0.0, (ratio - 0.5) * 2.0)
 
 
+def _score_velocity(pair: dict, cfg: dict) -> float:
+    """Score based on whether vol/liq ratio is INCREASING vs previous cycle.
+    Returns 0-1. Requires previous metrics stored in DB."""
+    import storage  # local import to avoid circular
+
+    base = pair.get("baseToken") or {}
+    addr = base.get("address") or ""
+    chain_id = (pair.get("chainId") or "").lower()
+
+    if not addr:
+        return 0.5  # neutral if we can't identify token
+
+    vol = (_safe(pair, "volume", "h24", default=0) or 0)
+    liq = (_safe(pair, "liquidity", "usd", default=0) or 0)
+    current_ratio = vol / liq if liq > 0 else 0
+
+    prev = storage.get_previous_metrics(addr, chain_id)
+    if prev is None:
+        return 0.5  # first time seeing this token, neutral
+
+    prev_ratio = prev.get("vol_liq_ratio", 0) or 0
+    if prev_ratio <= 0:
+        return 0.5
+
+    # Calculate acceleration: how much did the ratio increase?
+    change = (current_ratio - prev_ratio) / prev_ratio
+    # Normalize: +50% increase = score 1.0, -50% decrease = score 0.0
+    return max(0.0, min(1.0, 0.5 + change))
+
+
+def _get_time_of_day_boost() -> float:
+    """Return a score multiplier based on current UTC hour.
+    US market hours (14:00-22:00 UTC) get a boost."""
+    hour = datetime.now(timezone.utc).hour
+    if 14 <= hour <= 21:  # peak memecoin hours
+        return 1.15  # 15% boost
+    elif 12 <= hour <= 23:  # extended hours
+        return 1.05  # 5% boost
+    return 1.0  # no boost
+
+
 # -- Scoring functions list (name -> function) --
 
 _SCORE_FNS: dict[str, Any] = {
@@ -125,6 +168,7 @@ _SCORE_FNS: dict[str, Any] = {
     "vol_liq_ratio": _score_volume_liquidity,
     "price_change": _score_price_change,
     "buy_sell_ratio": _score_buy_sell_ratio,
+    "velocity": _score_velocity,
 }
 
 
@@ -144,6 +188,12 @@ def score_pair(pair: dict, cfg: dict | None = None) -> dict:
         breakdown[name] = round(raw, 3)
         weight = weights.get(name, 0)
         total += raw * weight
+
+    # Apply time-of-day boost
+    boost = _get_time_of_day_boost()
+    total *= boost
+    if boost > 1.0:
+        breakdown["time_boost"] = round(boost, 2)
 
     total = round(min(total, 100.0), 1)
     return {"score": total, "breakdown": breakdown, "pair": pair}
