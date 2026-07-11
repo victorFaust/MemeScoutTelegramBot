@@ -234,10 +234,16 @@ def evaluate_safety(chain_id: str, token_address: str) -> tuple[bool, dict[str, 
                   send with a warning on failure, depending on config).
     safety_data: The safety result dict, or None if check failed.
     """
+    # Skip GoPlus entirely for chains it doesn't support (not a failure, just unsupported)
+    chain_lower = chain_id.lower()
+    if chain_lower != "solana" and chain_lower not in _GOPLUS_CHAIN_MAP:
+        logger.debug("GoPlus not available for chain '%s' -- passing through", chain_id)
+        return True, None
+
     safety = check_token_safety(chain_id, token_address)
 
     if safety is None:
-        # API failure — check per-chain override first, then global setting
+        # Actual API failure (not just unsupported chain)
         chain_cfg = config.get_chain_profile(chain_id)
         skip = chain_cfg.get("safety_skip_on_failure", config.SKIP_ON_SAFETY_CHECK_FAILURE)
         if skip:
