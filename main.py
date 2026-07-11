@@ -149,20 +149,34 @@ async def _run_chain_cycle(chain_id: str) -> None:
         base = pair.get("baseToken") or {}
         addr = base.get("address") or pair.get("tokenAddress", "")
 
-        # Check if recently alerted
+        # Momentum-only mode: first sighting records silently, alert only on acceleration
+        prev_score = storage.get_previous_alert_score(chain, addr)
+
+        if prev_score is None:
+            # First time seeing this token -- record score silently, no alert
+            storage.record_alert(chain, addr, result["score"])
+            logger.debug("[%s] %s first seen (score=%.1f) -- tracking, no alert yet",
+                         chain_id, base.get("symbol", "?"), result["score"])
+            continue
+
+        # Already tracked -- check if momentum confirmed
+        score_delta = result["score"] - prev_score
+        if score_delta < momentum_threshold:
+            # Update stored score if it's higher (track the peak)
+            if result["score"] > prev_score:
+                storage.record_alert(chain, addr, result["score"])
+            continue
+
+        # Check dedup cooldown (don't re-alert same token within cooldown)
         if storage.was_recently_alerted(chain, addr):
-            # Momentum re-alert: if score jumped significantly, send follow-up
-            prev_score = storage.get_previous_alert_score(chain, addr)
-            if prev_score is not None and result["score"] - prev_score >= momentum_threshold:
-                logger.info("[%s] Momentum re-alert for %s: %.1f -> %.1f (+%.1f)",
-                            chain_id, base.get("symbol", "?"), prev_score, result["score"],
-                            result["score"] - prev_score)
-                result["momentum_realert"] = True
-                result["prev_score"] = prev_score
-            else:
-                continue
-        else:
-            result["momentum_realert"] = False
+            # Only re-alert if the jump is from the LAST alerted score
+            continue
+
+        # Momentum confirmed -- proceed with safety checks and alert
+        logger.info("[%s] MOMENTUM for %s: %.1f -> %.1f (+%.1f)",
+                    chain_id, base.get("symbol", "?"), prev_score, result["score"], score_delta)
+        result["momentum_realert"] = True
+        result["prev_score"] = prev_score
 
         should_alert, safety_data = safety_check.evaluate_safety(chain, addr)
         if not should_alert:
