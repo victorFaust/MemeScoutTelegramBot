@@ -68,8 +68,8 @@ solana:
 
 robinhood:
   poll_interval_seconds: 75
-  min_market_cap: 3000
-  max_market_cap: 150000
+  min_market_cap: 5000
+  max_market_cap: 10000
   min_liquidity_usd: 2000
   max_liquidity_usd: 50000
   max_pair_age_hours: 72
