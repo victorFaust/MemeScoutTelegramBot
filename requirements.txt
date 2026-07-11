@@ -2,3 +2,4 @@ requests>=2.31,<3
 python-telegram-bot>=20.7,<21
 python-dotenv>=1.0,<2
 pyyaml>=6.0,<7
+apscheduler>=3.10,<4
