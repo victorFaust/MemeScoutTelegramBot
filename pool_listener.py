@@ -90,11 +90,11 @@ def _get_recent_signatures(program_id: str, limit: int = 10, before: str | None 
 
 
 def _fetch_transaction(signature: str) -> dict | None:
-    """Fetch a parsed transaction by signature. Uses QuickNode (heavier call)."""
+    """Fetch a parsed transaction by signature. Uses public RPC to avoid QuickNode rate limits."""
     result = _rpc_call("getTransaction", [
         signature,
         {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-    ], use_quicknode=True)
+    ], use_quicknode=False)
     return result
 
 
