@@ -364,13 +364,13 @@ async def main() -> None:
     asyncio.create_task(_status_log_loop())
     asyncio.create_task(_cleanup_loop())
 
-    # Start real-time pool listener (QuickNode websocket) if configured
-    if config.QUICKNODE_WSS_URL:
+    # Start real-time pool listener (QuickNode HTTP polling) if configured
+    if config.QUICKNODE_HTTP_URL:
         listener = pool_listener.PoolListener(on_new_pool=_handle_new_pool)
         asyncio.create_task(listener.start())
-        logger.info("[WS] Real-time pool listener started (Pump.fun + Raydium)")
+        logger.info("[POOL] Pump.fun pool poller started")
     else:
-        logger.warning("[WS] QUICKNODE_WSS_URL not set -- real-time pool detection disabled")
+        logger.warning("[POOL] QUICKNODE_HTTP_URL not set -- pool detection disabled")
 
     # Keep the event loop alive
     try:
