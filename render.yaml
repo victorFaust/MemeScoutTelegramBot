@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: memescout-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # set manually in Render dashboard
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: CHAINS
+        value: solana,robinhood
+      - key: DEDUP_COOLDOWN_HOURS
+        value: "6"
+      - key: SAFETY_CHECK_CACHE_HOURS
+        value: "1"
+      - key: SKIP_ON_SAFETY_CHECK_FAILURE
+        value: "true"
+      - key: LOG_FILE
+        value: /tmp/bot.log
+      - key: PYTHON_VERSION
+        value: "3.12.0"
