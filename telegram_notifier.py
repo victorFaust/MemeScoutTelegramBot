@@ -1,6 +1,7 @@
 """Send formatted alert messages to Telegram."""
 
 import logging
+import time
 from typing import Any
 
 import telegram
@@ -165,4 +166,50 @@ async def send_alert(result: dict, safety: dict | None = None) -> bool:
         return True
     except Exception:
         logger.exception("Failed to send Telegram alert")
+        return False
+
+
+async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> bool:
+    """Send alert for a brand-new pool detected via websocket."""
+    if not config.TELEGRAM_CHAT_ID:
+        return False
+
+    token_addr = token_info.get("token_address", "???")
+    sol = token_info.get("sol_deposited", 0)
+    latency = token_info.get("detected_at", 0)
+    latency_s = f"{(time.time() - latency):.1f}s" if latency else "?"
+
+    dex_url = f"https://dexscreener.com/solana/{token_addr}"
+
+    lines = [
+        "*NEW POOL DETECTED*  --  Speed Alert",
+        "Chain: `SOLANA`",
+        "",
+        f"Token: `{token_addr}`",
+        f"Initial liquidity: ~{sol:.1f} SOL (${sol * 170:.0f})",
+        f"Detection latency: {latency_s}",
+    ]
+
+    if rc_data:
+        rc_score = rc_data.get("rugcheck_score")
+        lp_locked = rc_data.get("lp_locked_pct", 0)
+        if rc_score is not None:
+            lines.append(f"RugCheck: {rc_score:.0%} safe | LP: {lp_locked:.0f}%")
+
+    lines.append("")
+    lines.append(f"[View on DexScreener]({dex_url})")
+    lines.append("")
+    lines.append("_Early detection -- DYOR, no score yet_")
+
+    text = "\n".join(lines)
+    try:
+        bot = _get_bot()
+        await bot.send_message(
+            chat_id=config.TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode=telegram.constants.ParseMode.MARKDOWN,
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to send new pool alert")
         return False
