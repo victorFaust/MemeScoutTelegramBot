@@ -79,13 +79,20 @@ def build_message(result: dict, safety: dict | None = None) -> str:
         "",
         f"*{name}* (${symbol})",
         "",
-        f"Liquidity: {_fmt_num(liq)}",
-        f"Market Cap: {_fmt_num(mc)}",
-        f"Volume 24h: {_fmt_num(vol_24h)}",
-        "",
-        f"1h: {_fmt_pct(pc.get('h1'))}  |  6h: {_fmt_pct(pc.get('h6'))}  |  24h: {_fmt_pct(pc.get('h24'))}",
-        f"Buys/Sells (1h): {buy_ratio}",
     ]
+
+    # For Robinhood Chain, show market cap first and prominently
+    if chain_lower == "robinhood":
+        lines.append(f"*Market Cap: {_fmt_num(mc)}*")
+        lines.append(f"Liquidity: {_fmt_num(liq)}")
+    else:
+        lines.append(f"Liquidity: {_fmt_num(liq)}")
+        lines.append(f"Market Cap: {_fmt_num(mc)}")
+
+    lines.append(f"Volume 24h: {_fmt_num(vol_24h)}")
+    lines.append("")
+    lines.append(f"1h: {_fmt_pct(pc.get('h1'))}  |  6h: {_fmt_pct(pc.get('h6'))}  |  24h: {_fmt_pct(pc.get('h24'))}")
+    lines.append(f"Buys/Sells (1h): {buy_ratio}")
 
     # Safety check section
     if safety:

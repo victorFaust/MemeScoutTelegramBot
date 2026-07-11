@@ -237,9 +237,11 @@ def evaluate_safety(chain_id: str, token_address: str) -> tuple[bool, dict[str, 
     safety = check_token_safety(chain_id, token_address)
 
     if safety is None:
-        # API failure
-        if config.SKIP_ON_SAFETY_CHECK_FAILURE:
-            logger.warning("Safety check failed for %s on %s -- skipping (SKIP_ON_SAFETY_CHECK_FAILURE=true)", token_address, chain_id)
+        # API failure — check per-chain override first, then global setting
+        chain_cfg = config.get_chain_profile(chain_id)
+        skip = chain_cfg.get("safety_skip_on_failure", config.SKIP_ON_SAFETY_CHECK_FAILURE)
+        if skip:
+            logger.warning("Safety check failed for %s on %s -- skipping (skip_on_failure=true)", token_address, chain_id)
             return False, None
         else:
             logger.warning("Safety check failed for %s on %s -- alerting with warning", token_address, chain_id)

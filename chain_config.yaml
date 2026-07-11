@@ -1,39 +1,8 @@
-# chain_config.yaml — Per-chain filter thresholds and safety check settings.
-# Edit this file to tune thresholds without touching Python code.
-# Any chain listed in CHAINS (.env) that is NOT in this file will use "default".
+﻿# chain_config.yaml -- Per-chain filter thresholds and safety check settings.
+# Only Solana and Robinhood Chain are active.
+# Any chain in CHAINS (.env) without an entry here will use "default".
 
 default:
-  # -- Filter thresholds --
-  min_liquidity_usd: 5000
-  max_liquidity_usd: 50000
-  max_market_cap: 500000
-  max_pair_age_hours: 168        # 7 days
-  min_volume_liquidity_ratio: 0.5
-  min_price_change_1h: 0.0
-  min_price_change_6h: 0.0
-  min_buy_sell_ratio: 1.0        # buys/sells >= this
-  min_txns_1h: 10
-  min_alert_score: 50
-
-  # -- Scoring weights (should sum to 100) --
-  weights:
-    liquidity: 15
-    market_cap: 15
-    pair_age: 10
-    vol_liq_ratio: 20
-    price_change: 20
-    buy_sell_ratio: 20
-
-  # -- Safety check thresholds --
-  safety:
-    max_buy_tax_pct: 10
-    max_sell_tax_pct: 10
-    max_top10_holder_pct: 70
-    reject_honeypot: true
-    reject_mint_authority: true    # For Solana: reject if mint authority not renounced
-    reject_blacklist: true
-
-solana:
   min_liquidity_usd: 5000
   max_liquidity_usd: 50000
   max_market_cap: 500000
@@ -41,7 +10,7 @@ solana:
   min_volume_liquidity_ratio: 0.5
   min_price_change_1h: 0.0
   min_price_change_6h: 0.0
-  min_buy_sell_ratio: 1.2
+  min_buy_sell_ratio: 1.0
   min_txns_1h: 10
   min_alert_score: 50
 
@@ -61,17 +30,17 @@ solana:
     reject_mint_authority: true
     reject_blacklist: true
 
-base:
-  min_liquidity_usd: 3000        # Base pools tend to start smaller
-  max_liquidity_usd: 80000
-  max_market_cap: 750000
-  max_pair_age_hours: 120        # 5 days
-  min_volume_liquidity_ratio: 0.4
+solana:
+  min_liquidity_usd: 5000
+  max_liquidity_usd: 50000
+  max_market_cap: 500000
+  max_pair_age_hours: 168
+  min_volume_liquidity_ratio: 0.8
   min_price_change_1h: 0.0
   min_price_change_6h: 0.0
-  min_buy_sell_ratio: 1.0
-  min_txns_1h: 8
-  min_alert_score: 45
+  min_buy_sell_ratio: 1.3
+  min_txns_1h: 15
+  min_alert_score: 50
 
   weights:
     liquidity: 15
@@ -86,5 +55,35 @@ base:
     max_sell_tax_pct: 10
     max_top10_holder_pct: 70
     reject_honeypot: true
-    reject_mint_authority: false   # N/A for EVM
+    reject_mint_authority: true
+    reject_blacklist: true
+
+robinhood:
+  min_market_cap: 5000
+  max_market_cap: 10000
+  min_liquidity_usd: 3000
+  max_liquidity_usd: 30000
+  max_pair_age_hours: 48
+  min_volume_liquidity_ratio: 1.0
+  min_price_change_1h: 0.0
+  min_price_change_6h: 0.0
+  min_buy_sell_ratio: 1.3
+  min_txns_1h: 15
+  min_alert_score: 45
+  safety_skip_on_failure: true
+
+  weights:
+    liquidity: 15
+    market_cap: 20
+    pair_age: 10
+    vol_liq_ratio: 20
+    price_change: 15
+    buy_sell_ratio: 20
+
+  safety:
+    max_buy_tax_pct: 10
+    max_sell_tax_pct: 10
+    max_top10_holder_pct: 70
+    reject_honeypot: true
+    reject_mint_authority: false
     reject_blacklist: true
