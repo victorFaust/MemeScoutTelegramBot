@@ -48,7 +48,7 @@ def _fmt_pct(n: float | None) -> str:
     return f"{sign}{n:.1f}%"
 
 
-def build_message(result: dict) -> str:
+def build_message(result: dict, safety: dict | None = None) -> str:
     """Build a Markdown-formatted Telegram message from a scored result."""
     pair = result["pair"]
     score = result["score"]
@@ -85,9 +85,35 @@ def build_message(result: dict) -> str:
         "",
         f"1h: {_fmt_pct(pc.get('h1'))}  |  6h: {_fmt_pct(pc.get('h6'))}  |  24h: {_fmt_pct(pc.get('h24'))}",
         f"Buys/Sells (1h): {buy_ratio}",
-        "",
-        f"Score: *{score}/100*",
     ]
+
+    # Safety check section
+    if safety:
+        lines.append("")
+        if safety.get("check_failed"):
+            lines.append("-- SAFETY: check unavailable --")
+        else:
+            risk = safety.get("risk_label", "N/A")
+            risk_icon = {"LOW": "LOW", "MEDIUM": "MEDIUM", "HIGH": "HIGH"}.get(risk, "???")
+            lines.append(f"-- SAFETY: {risk_icon} risk --")
+
+            buy_tax = safety.get("buy_tax_pct")
+            sell_tax = safety.get("sell_tax_pct")
+            if buy_tax is not None or sell_tax is not None:
+                bt = f"{buy_tax:.1f}%" if buy_tax is not None else "N/A"
+                st = f"{sell_tax:.1f}%" if sell_tax is not None else "N/A"
+                lines.append(f"Tax: buy {bt} / sell {st}")
+
+            mint = safety.get("mint_authority_active")
+            if mint is not None:
+                lines.append(f"Mint authority: {'ACTIVE' if mint else 'Renounced'}")
+
+            top10 = safety.get("top10_holder_pct")
+            if top10 is not None:
+                lines.append(f"Top 10 holders: {top10:.1f}%")
+
+    lines.append("")
+    lines.append(f"Score: *{score}/100*")
 
     if dex_url:
         lines.append(f"[View on DexScreener]({dex_url})")
@@ -95,12 +121,12 @@ def build_message(result: dict) -> str:
     return "\n".join(lines)
 
 
-async def send_alert(result: dict) -> bool:
+async def send_alert(result: dict, safety: dict | None = None) -> bool:
     """Send a single alert message. Returns True on success."""
     if not config.TELEGRAM_CHAT_ID:
         logger.error("TELEGRAM_CHAT_ID is not set -- skipping alert")
         return False
-    text = build_message(result)
+    text = build_message(result, safety)
     try:
         bot = _get_bot()
         await bot.send_message(

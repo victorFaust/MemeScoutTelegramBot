@@ -1,7 +1,7 @@
 """Scoring and filtering logic for memecoin pairs.
 
-Every pair is scored 0-100. Individual sub-scores are weighted and summed.
-All thresholds come from config.py (ultimately .env).
+Every pair is scored 0-100. Sub-scores are weighted per the chain profile.
+Thresholds are loaded per-chain from chain_config.yaml via config.get_chain_profile().
 """
 
 import logging
@@ -37,147 +37,159 @@ def _pair_age_hours(pair: dict) -> float | None:
 
 
 # -- Sub-score functions (each returns 0-1) --
+# All accept the chain profile dict (cfg) so they use per-chain thresholds.
 
-def _score_liquidity(pair: dict) -> float:
-    """Higher when liquidity sits in the sweet-spot range."""
+def _score_liquidity(pair: dict, cfg: dict) -> float:
     liq = _safe(pair, "liquidity", "usd", default=0)
-    if liq < config.MIN_LIQUIDITY_USD or liq > config.MAX_LIQUIDITY_USD:
+    min_liq = cfg.get("min_liquidity_usd", 5000)
+    max_liq = cfg.get("max_liquidity_usd", 50000)
+    if liq < min_liq or liq > max_liq:
         return 0.0
-    mid = (config.MIN_LIQUIDITY_USD + config.MAX_LIQUIDITY_USD) / 2
-    distance = abs(liq - mid) / (config.MAX_LIQUIDITY_USD - config.MIN_LIQUIDITY_USD)
+    mid = (min_liq + max_liq) / 2
+    distance = abs(liq - mid) / (max_liq - min_liq)
     return max(0.0, 1.0 - distance)
 
 
-def _score_market_cap(pair: dict) -> float:
-    """Lower market cap -> higher score (room to grow)."""
+def _score_market_cap(pair: dict, cfg: dict) -> float:
     mc = pair.get("marketCap") or pair.get("fdv") or 0
-    if mc <= 0 or mc > config.MAX_MARKET_CAP:
+    max_mc = cfg.get("max_market_cap", 500000)
+    if mc <= 0 or mc > max_mc:
         return 0.0
-    return 1.0 - (mc / config.MAX_MARKET_CAP)
+    return 1.0 - (mc / max_mc)
 
 
-def _score_pair_age(pair: dict) -> float:
-    """Newer pairs score higher (within the allowed window)."""
+def _score_pair_age(pair: dict, cfg: dict) -> float:
     age_h = _pair_age_hours(pair)
-    if age_h is None or age_h > config.MAX_PAIR_AGE_HOURS:
+    max_age = cfg.get("max_pair_age_hours", 168)
+    if age_h is None or age_h > max_age:
         return 0.0
-    return 1.0 - (age_h / config.MAX_PAIR_AGE_HOURS)
+    return 1.0 - (age_h / max_age)
 
 
-def _score_volume_liquidity(pair: dict) -> float:
-    """Volume-to-liquidity ratio -- higher means more active trading."""
+def _score_volume_liquidity(pair: dict, cfg: dict) -> float:
     vol = _safe(pair, "volume", "h24", default=0)
     liq = _safe(pair, "liquidity", "usd", default=0)
     if liq <= 0:
         return 0.0
     ratio = vol / liq
-    if ratio < config.MIN_VOLUME_LIQUIDITY_RATIO:
+    min_ratio = cfg.get("min_volume_liquidity_ratio", 0.5)
+    if ratio < min_ratio:
         return 0.0
-    # Cap the score at ratio = 5x for normalization
     return min(ratio / 5.0, 1.0)
 
 
-def _score_price_change(pair: dict) -> float:
-    """Positive momentum on 1h and 6h windows."""
+def _score_price_change(pair: dict, cfg: dict) -> float:
     pc = pair.get("priceChange") or {}
     h1 = pc.get("h1", 0) or 0
     h6 = pc.get("h6", 0) or 0
-    if h1 < config.MIN_PRICE_CHANGE_1H or h6 < config.MIN_PRICE_CHANGE_6H:
+    min_h1 = cfg.get("min_price_change_1h", 0.0)
+    min_h6 = cfg.get("min_price_change_6h", 0.0)
+    if h1 < min_h1 or h6 < min_h6:
         return 0.0
-    # Normalize: +50% maps to 1.0
     s1 = min(max(h1, 0) / 50.0, 1.0)
     s6 = min(max(h6, 0) / 50.0, 1.0)
     return (s1 + s6) / 2.0
 
 
-def _score_buy_sell_ratio(pair: dict) -> float:
-    """More buys than sells in the last hour -> bullish."""
+def _score_buy_sell_ratio(pair: dict, cfg: dict) -> float:
     txns = pair.get("txns") or {}
     h1 = txns.get("h1") or {}
     buys = h1.get("buys", 0) or 0
     sells = h1.get("sells", 0) or 0
     total = buys + sells
-    if total < config.MIN_TX_COUNT_1H:
-        return 0.0  # Too few transactions -- suspicious / dead
+    min_txns = cfg.get("min_txns_1h", 10)
+    if total < min_txns:
+        return 0.0
     ratio = buys / total
-    # 0.5 -> neutral (0.0 score), 1.0 -> all buys (1.0 score)
     return max(0.0, (ratio - 0.5) * 2.0)
 
 
-# -- Weights --
-# Each tuple: (name, weight-out-of-100, scoring-function)
+# -- Scoring functions list (name -> function) --
 
-_WEIGHTS: list[tuple[str, float, Any]] = [
-    ("liquidity",      15, _score_liquidity),
-    ("market_cap",     15, _score_market_cap),
-    ("pair_age",       10, _score_pair_age),
-    ("vol_liq_ratio",  20, _score_volume_liquidity),
-    ("price_change",   20, _score_price_change),
-    ("buy_sell_ratio", 20, _score_buy_sell_ratio),
-]
+_SCORE_FNS: dict[str, Any] = {
+    "liquidity": _score_liquidity,
+    "market_cap": _score_market_cap,
+    "pair_age": _score_pair_age,
+    "vol_liq_ratio": _score_volume_liquidity,
+    "price_change": _score_price_change,
+    "buy_sell_ratio": _score_buy_sell_ratio,
+}
 
 
-def score_pair(pair: dict) -> dict:
-    """Score a single pair dict. Returns a result dict with per-component
-    scores, the total weighted score (0-100), and the original pair data."""
+def score_pair(pair: dict, cfg: dict | None = None) -> dict:
+    """Score a single pair using the given chain profile.
+    Returns {"score": float, "breakdown": dict, "pair": dict}."""
+    if cfg is None:
+        chain_id = (pair.get("chainId") or "").lower()
+        cfg = config.get_chain_profile(chain_id)
+
+    weights = cfg.get("weights", {})
     breakdown: dict[str, float] = {}
     total = 0.0
-    for name, weight, fn in _WEIGHTS:
-        raw = fn(pair)
+
+    for name, fn in _SCORE_FNS.items():
+        raw = fn(pair, cfg)
         breakdown[name] = round(raw, 3)
+        weight = weights.get(name, 0)
         total += raw * weight
 
     total = round(min(total, 100.0), 1)
-
-    return {
-        "score": total,
-        "breakdown": breakdown,
-        "pair": pair,
-    }
+    return {"score": total, "breakdown": breakdown, "pair": pair}
 
 
-# -- Hard-reject gate (fast pre-filter before scoring) --
+# -- Hard-reject gate --
 
-def passes_hard_filters(pair: dict) -> bool:
-    """Return False for pairs that should never be scored at all."""
+def passes_hard_filters(pair: dict, cfg: dict | None = None) -> bool:
+    """Return False for pairs that should never be scored."""
+    if cfg is None:
+        chain_id = (pair.get("chainId") or "").lower()
+        cfg = config.get_chain_profile(chain_id)
+
     liq = _safe(pair, "liquidity", "usd", default=0)
-    if liq < config.MIN_LIQUIDITY_USD or liq > config.MAX_LIQUIDITY_USD:
+    if liq < cfg.get("min_liquidity_usd", 5000) or liq > cfg.get("max_liquidity_usd", 50000):
         return False
 
     mc = pair.get("marketCap") or pair.get("fdv") or 0
-    if mc <= 0 or mc > config.MAX_MARKET_CAP:
+    if mc <= 0 or mc > cfg.get("max_market_cap", 500000):
         return False
 
     age = _pair_age_hours(pair)
-    if age is not None and age > config.MAX_PAIR_AGE_HOURS:
+    if age is not None and age > cfg.get("max_pair_age_hours", 168):
         return False
 
     txns = _safe(pair, "txns", "h1", default={})
     total_tx = (txns.get("buys", 0) or 0) + (txns.get("sells", 0) or 0)
-    if total_tx < config.MIN_TX_COUNT_1H:
+    if total_tx < cfg.get("min_txns_1h", 10):
+        return False
+
+    # Buy/sell ratio hard filter
+    buys = (txns.get("buys", 0) or 0)
+    sells = (txns.get("sells", 0) or 0)
+    min_ratio = cfg.get("min_buy_sell_ratio", 1.0)
+    if sells > 0 and (buys / sells) < min_ratio:
+        return False
+    elif sells == 0 and buys == 0:
         return False
 
     return True
 
 
 def filter_and_score(pairs: list[dict], min_score: float | None = None) -> list[dict]:
-    """Filter a list of pair dicts and return scored results sorted
-    descending by score. Only pairs above min_score are returned."""
-    if min_score is None:
-        min_score = config.MIN_ALERT_SCORE
-
+    """Filter and score pairs using per-chain profiles.
+    Returns scored results sorted descending by score."""
     results = []
     for p in pairs:
-        if not passes_hard_filters(p):
+        chain_id = (p.get("chainId") or "").lower()
+        cfg = config.get_chain_profile(chain_id)
+
+        if not passes_hard_filters(p, cfg):
             continue
-        result = score_pair(p)
-        if result["score"] >= min_score:
+
+        result = score_pair(p, cfg)
+        threshold = min_score if min_score is not None else cfg.get("min_alert_score", 50)
+        if result["score"] >= threshold:
             results.append(result)
 
     results.sort(key=lambda r: r["score"], reverse=True)
-    logger.info(
-        "Scored %d pairs -> %d passed hard filters -> %d above min score %.1f",
-        len(pairs), sum(1 for p in pairs if passes_hard_filters(p)),
-        len(results), min_score,
-    )
+    logger.info("Scored %d pairs -> %d passed filters", len(pairs), len(results))
     return results
