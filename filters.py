@@ -51,10 +51,22 @@ def _score_liquidity(pair: dict, cfg: dict) -> float:
 
 
 def _score_market_cap(pair: dict, cfg: dict) -> float:
+    """When both min and max MC are set, score based on position within band.
+    Otherwise, lower MC = higher score (original logic)."""
     mc = pair.get("marketCap") or pair.get("fdv") or 0
+    min_mc = cfg.get("min_market_cap", 0)
     max_mc = cfg.get("max_market_cap", 500000)
     if mc <= 0 or mc > max_mc:
         return 0.0
+    if min_mc > 0 and mc < min_mc:
+        return 0.0
+    if min_mc > 0:
+        # Band mode: center of band scores highest
+        mid = (min_mc + max_mc) / 2
+        half_range = (max_mc - min_mc) / 2
+        distance = abs(mc - mid) / half_range
+        return max(0.0, 1.0 - distance)
+    # Default: lower = better
     return 1.0 - (mc / max_mc)
 
 
@@ -150,7 +162,11 @@ def passes_hard_filters(pair: dict, cfg: dict | None = None) -> bool:
         return False
 
     mc = pair.get("marketCap") or pair.get("fdv") or 0
-    if mc <= 0 or mc > cfg.get("max_market_cap", 500000):
+    min_mc = cfg.get("min_market_cap", 0)
+    max_mc = cfg.get("max_market_cap", 500000)
+    if mc <= 0 or mc > max_mc:
+        return False
+    if min_mc > 0 and mc < min_mc:
         return False
 
     age = _pair_age_hours(pair)
