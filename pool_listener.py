@@ -205,11 +205,13 @@ class PoolListener:
         while self._running:
             try:
                 await self._listen()
-                delay = _RECONNECT_DELAY  # reset on clean connection
+                logger.warning("[WS] Connection ended cleanly (no error). Reconnecting in %ds...", delay)
             except websockets.exceptions.ConnectionClosed as e:
-                logger.warning("[WS] Connection closed: %s. Reconnecting in %ds...", e, delay)
+                logger.warning("[WS] Connection closed: code=%s reason='%s'. Reconnecting in %ds...",
+                               e.code, e.reason, delay)
             except Exception as e:
-                logger.error("[WS] Unexpected error: %s. Reconnecting in %ds...", e, delay)
+                logger.error("[WS] Unexpected error: %s (%s). Reconnecting in %ds...",
+                             e, type(e).__name__, delay)
 
             if self._running:
                 await asyncio.sleep(delay)
@@ -223,21 +225,32 @@ class PoolListener:
         url = _get_wss_url()
         logger.info("[WS] Connecting to QuickNode websocket...")
 
-        async with websockets.connect(url, ping_interval=_PING_INTERVAL, ping_timeout=10) as ws:
-            logger.info("[WS] Connected. Subscribing to Pump.fun + Raydium...")
-
-            # Subscribe to both programs
+        async with websockets.connect(
+            url,
+            ping_interval=_PING_INTERVAL,
+            ping_timeout=10,
+            max_size=2**20,  # 1MB max message size
+            close_timeout=5,
+        ) as ws:
+            # Only subscribe to Pump.fun (Raydium generates too much volume for free tier)
+            logger.info("[WS] Connected. Subscribing to Pump.fun...")
             await _subscribe(ws, PUMP_FUN_PROGRAM, 1)
-            await _subscribe(ws, RAYDIUM_AMM_PROGRAM, 2)
 
+            # Wait for subscription confirmation
+            msg_count = 0
             async for message in ws:
+                msg_count += 1
                 try:
                     data = json.loads(message)
                     await self._handle_message(data)
                 except json.JSONDecodeError:
+                    logger.debug("[WS] Non-JSON message: %s", message[:100])
                     continue
                 except Exception as e:
                     logger.error("[WS] Error processing message: %s", e)
+
+            # If we get here, the loop ended (connection closed)
+            logger.warning("[WS] Message loop ended after %d messages", msg_count)
 
     async def _handle_message(self, data: dict) -> None:
         """Process a websocket message."""
