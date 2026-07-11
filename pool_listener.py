@@ -1,11 +1,11 @@
-﻿"""Real-time Solana new pool listener via QuickNode HTTP RPC polling.
+﻿"""Solana new pool listener via HTTP RPC polling.
 
-Polls getSignaturesForAddress on the Pump.fun program every few seconds
-to detect new pool creation transactions. Works on QuickNode free tier.
+Uses Solana public RPC for pool detection polling (no rate limit key needed).
+Falls back to QuickNode for transaction parsing if public RPC fails.
+Polls every 30s to stay conservative with public RPC limits.
 """
 
 import asyncio
-import json
 import logging
 import time
 from typing import Any, Callable
@@ -20,51 +20,81 @@ logger = logging.getLogger(__name__)
 # Program IDs to monitor for new pools
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-# Polling interval (seconds)
-_POLL_INTERVAL = 8  # Check every 8 seconds
+# Polling interval (seconds) -- 30s for public RPC stability
+_POLL_INTERVAL = 30
+_BACKOFF_INTERVAL = 60  # Back off to this on rate limit errors
 
 # Minimum initial liquidity to consider (in SOL)
 _MIN_INITIAL_LIQUIDITY_SOL = 3.0
 
+# Free Solana public RPCs (rotate on failure)
+_PUBLIC_RPCS = [
+    "https://api.mainnet-beta.solana.com",
+    "https://solana-mainnet.g.alchemy.com/v2/demo",
+]
+_current_rpc_index = 0
 
-def _rpc_call(method: str, params: list) -> Any:
-    """Make a Solana JSON-RPC call via QuickNode HTTP endpoint."""
-    url = config.QUICKNODE_HTTP_URL
-    if not url:
-        return None
+
+def _get_pool_rpc_url() -> str:
+    """Get the RPC URL for pool polling. Uses public RPC to avoid QuickNode rate limits."""
+    global _current_rpc_index
+    return _PUBLIC_RPCS[_current_rpc_index % len(_PUBLIC_RPCS)]
+
+
+def _rotate_rpc() -> None:
+    """Switch to next public RPC on failure."""
+    global _current_rpc_index
+    _current_rpc_index += 1
+    logger.info("[POOL] Rotated to RPC: %s", _get_pool_rpc_url())
+
+
+def _rpc_call(method: str, params: list, use_quicknode: bool = False) -> Any:
+    """Make a Solana JSON-RPC call. Uses public RPC by default, QuickNode for heavy calls."""
+    if use_quicknode and config.QUICKNODE_HTTP_URL:
+        url = config.QUICKNODE_HTTP_URL
+    else:
+        url = _get_pool_rpc_url()
+
     try:
         resp = requests.post(url, json={
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
             "params": params,
-        }, timeout=10)
+        }, timeout=15)
+
+        if resp.status_code == 429:
+            logger.warning("[POOL] Rate limited on %s -- rotating RPC", url[:40])
+            _rotate_rpc()
+            return None
+
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
-            logger.error("[POOL] RPC error (%s): %s", method, data["error"])
+            logger.debug("[POOL] RPC error (%s): %s", method, data.get("error", {}).get("message", ""))
             return None
         return data.get("result")
     except requests.RequestException as e:
-        logger.error("[POOL] RPC request failed (%s): %s", method, e)
+        logger.warning("[POOL] RPC request failed (%s): %s", method, e)
+        _rotate_rpc()
         return None
 
 
 def _get_recent_signatures(program_id: str, limit: int = 10, before: str | None = None) -> list[dict]:
-    """Get recent transaction signatures for a program."""
+    """Get recent transaction signatures for a program. Uses public RPC."""
     params: list = [program_id, {"limit": limit, "commitment": "confirmed"}]
     if before:
         params[1]["before"] = before
-    result = _rpc_call("getSignaturesForAddress", params)
+    result = _rpc_call("getSignaturesForAddress", params, use_quicknode=False)
     return result if result else []
 
 
 def _fetch_transaction(signature: str) -> dict | None:
-    """Fetch a parsed transaction by signature."""
+    """Fetch a parsed transaction by signature. Uses QuickNode (heavier call)."""
     result = _rpc_call("getTransaction", [
         signature,
         {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-    ])
+    ], use_quicknode=True)
     return result
 
 
@@ -163,25 +193,38 @@ class PoolListener:
         self._running = False
         self._last_signature: str | None = None
         self._seen_signatures: set = set()
+        self._current_interval = _POLL_INTERVAL
+        self._consecutive_errors = 0
 
     async def start(self) -> None:
         """Start polling loop."""
         self._running = True
-        logger.info("[POOL] Starting Pump.fun pool poller (interval=%ds)", _POLL_INTERVAL)
+        logger.info("[POOL] Starting Pump.fun pool poller (interval=%ds, rpc=%s)",
+                    _POLL_INTERVAL, _get_pool_rpc_url()[:40])
 
         # Initialize: get the latest signature so we only process NEW ones
         sigs = _get_recent_signatures(PUMP_FUN_PROGRAM, limit=1)
         if sigs:
             self._last_signature = sigs[0].get("signature")
-            logger.info("[POOL] Initialized -- latest sig: %s", self._last_signature[:16] if self._last_signature else "none")
+            logger.info("[POOL] Initialized -- latest sig: %s",
+                        self._last_signature[:16] if self._last_signature else "none")
+        else:
+            logger.warning("[POOL] Could not initialize -- will retry on next cycle")
 
         while self._running:
             try:
                 await self._poll_cycle()
             except Exception as e:
                 logger.error("[POOL] Error in poll cycle: %s", e)
+                self._consecutive_errors += 1
 
-            await asyncio.sleep(_POLL_INTERVAL)
+            # Back off on repeated errors
+            if self._consecutive_errors >= 3:
+                self._current_interval = _BACKOFF_INTERVAL
+            else:
+                self._current_interval = _POLL_INTERVAL
+
+            await asyncio.sleep(self._current_interval)
 
     def stop(self) -> None:
         self._running = False
@@ -193,7 +236,11 @@ class PoolListener:
         )
 
         if not sigs:
+            self._consecutive_errors += 1
             return
+
+        # Success -- reset error counter
+        self._consecutive_errors = 0
 
         # Process new signatures (newest first, stop at last seen)
         new_sigs = []
@@ -211,10 +258,11 @@ class PoolListener:
 
         logger.info("[POOL] Found %d new Pump.fun transactions", len(new_sigs))
 
-        # Process each new signature (limit to 3 per cycle to stay within rate limits)
-        for sig in new_sigs[:3]:
+        # Process each new signature (limit to 2 per cycle to conserve QuickNode credits)
+        for sig in new_sigs[:2]:
             self._seen_signatures.add(sig)
             await self._process_signature(sig)
+            await asyncio.sleep(1)  # Small delay between tx fetches
 
         # Trim seen set
         if len(self._seen_signatures) > 5000:
