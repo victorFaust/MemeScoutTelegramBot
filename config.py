@@ -40,6 +40,7 @@ SKIP_ON_SAFETY_CHECK_FAILURE: bool = os.getenv("SKIP_ON_SAFETY_CHECK_FAILURE", "
 
 # QuickNode Solana websocket
 QUICKNODE_WSS_URL: str = os.getenv("QUICKNODE_WSS_URL", "")
+QUICKNODE_HTTP_URL: str = os.getenv("QUICKNODE_HTTP_URL", "")
 
 LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")
 LOG_MAX_BYTES: int = _int("LOG_MAX_BYTES", 5_242_880)
