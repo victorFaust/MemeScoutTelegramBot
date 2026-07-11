@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -11,7 +12,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent / "alerts.db"
+DB_PATH = Path(os.getenv("DB_PATH", str(Path(__file__).parent / "alerts.db")))
 
 _CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS alerted_tokens (
