@@ -52,6 +52,7 @@ def build_message(result: dict, safety: dict | None = None) -> str:
     """Build a Markdown-formatted Telegram message from a scored result."""
     pair = result["pair"]
     score = result["score"]
+    is_momentum = result.get("momentum_realert", False)
 
     base = pair.get("baseToken") or {}
     name = base.get("name", "Unknown")
@@ -73,8 +74,15 @@ def build_message(result: dict, safety: dict | None = None) -> str:
     total_tx = buys + sells
     buy_ratio = f"{buys}/{sells}" if total_tx > 0 else "N/A"
 
+    # Header changes for momentum re-alerts
+    if is_momentum:
+        prev = result.get("prev_score", 0)
+        header = f"*MOMENTUM CONFIRMED*  --  Score: *{prev:.0f} -> {score}/100*"
+    else:
+        header = f"*NEW MEMECOIN ALERT*  --  Score: *{score}/100*"
+
     lines = [
-        f"*NEW MEMECOIN ALERT*  --  Score: *{score}/100*",
+        header,
         f"Chain: `{chain}`",
         "",
         f"*{name}* (${symbol})",

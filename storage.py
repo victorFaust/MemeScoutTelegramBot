@@ -53,6 +53,17 @@ CREATE TABLE IF NOT EXISTS alert_outcomes (
     checked_24h         INTEGER DEFAULT 0,
     rugged              INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS token_metrics (
+    token_address   TEXT NOT NULL,
+    chain_id        TEXT NOT NULL,
+    pair_address    TEXT NOT NULL,
+    recorded_at     REAL NOT NULL,
+    vol_liq_ratio   REAL,
+    buy_sell_ratio  REAL,
+    score           REAL,
+    PRIMARY KEY (token_address, chain_id)
+);
 """
 
 
@@ -234,5 +245,65 @@ def get_outcomes_for_report(days: int = 7) -> list[dict]:
             (cutoff,),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# -- Token metrics (velocity tracking) --
+
+def get_previous_metrics(token_address: str, chain_id: str) -> dict | None:
+    """Get the previously recorded metrics for a token."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM token_metrics WHERE token_address = ? AND chain_id = ?",
+            (token_address, chain_id),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def upsert_metrics(
+    token_address: str, chain_id: str, pair_address: str,
+    vol_liq_ratio: float, buy_sell_ratio: float, score: float,
+) -> None:
+    """Store/update current cycle metrics for velocity comparison."""
+    conn = _connect()
+    try:
+        conn.execute(
+            """INSERT INTO token_metrics (token_address, chain_id, pair_address, recorded_at, vol_liq_ratio, buy_sell_ratio, score)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(token_address, chain_id)
+               DO UPDATE SET pair_address = excluded.pair_address, recorded_at = excluded.recorded_at,
+                   vol_liq_ratio = excluded.vol_liq_ratio, buy_sell_ratio = excluded.buy_sell_ratio, score = excluded.score""",
+            (token_address, chain_id, pair_address, time.time(), vol_liq_ratio, buy_sell_ratio, score),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_previous_alert_score(chain_id: str, token_address: str) -> float | None:
+    """Get the score from the last alert for this token (for momentum re-alert)."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT score FROM alerted_tokens WHERE token_address = ? AND chain_id = ?",
+            (token_address, chain_id),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def cleanup_stale_metrics(hours: int = 24) -> None:
+    """Remove metrics older than N hours (tokens no longer showing up)."""
+    cutoff = time.time() - hours * 3600
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM token_metrics WHERE recorded_at < ?", (cutoff,))
+        conn.commit()
     finally:
         conn.close()

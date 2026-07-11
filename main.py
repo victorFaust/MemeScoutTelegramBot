@@ -123,15 +123,45 @@ async def _run_chain_cycle(chain_id: str) -> None:
     scored = filters.filter_and_score(all_pairs)
     logger.info("[%s] %d pairs passed scoring", chain_id, len(scored))
 
+    # Store metrics for velocity tracking (all pairs that passed hard filters)
+    for result in scored:
+        pair = result["pair"]
+        base = pair.get("baseToken") or {}
+        addr = base.get("address") or ""
+        if addr:
+            vol = (pair.get("volume") or {}).get("h24", 0) or 0
+            liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
+            vlr = vol / liq if liq > 0 else 0
+            txns = (pair.get("txns") or {}).get("h1") or {}
+            buys = txns.get("buys", 0) or 0
+            sells = txns.get("sells", 0) or 0
+            bsr = buys / sells if sells > 0 else buys
+            storage.upsert_metrics(addr, chain_id, pair.get("pairAddress", ""), vlr, bsr, result["score"])
+
     sent = 0
+    cfg = config.get_chain_profile(chain_id)
+    momentum_threshold = cfg.get("momentum_realert_threshold", 15)
+
     for result in scored:
         pair = result["pair"]
         chain = (pair.get("chainId") or "").lower()
         base = pair.get("baseToken") or {}
         addr = base.get("address") or pair.get("tokenAddress", "")
 
+        # Check if recently alerted
         if storage.was_recently_alerted(chain, addr):
-            continue
+            # Momentum re-alert: if score jumped significantly, send follow-up
+            prev_score = storage.get_previous_alert_score(chain, addr)
+            if prev_score is not None and result["score"] - prev_score >= momentum_threshold:
+                logger.info("[%s] Momentum re-alert for %s: %.1f -> %.1f (+%.1f)",
+                            chain_id, base.get("symbol", "?"), prev_score, result["score"],
+                            result["score"] - prev_score)
+                result["momentum_realert"] = True
+                result["prev_score"] = prev_score
+            else:
+                continue
+        else:
+            result["momentum_realert"] = False
 
         should_alert, safety_data = safety_check.evaluate_safety(chain, addr)
         if not should_alert:
