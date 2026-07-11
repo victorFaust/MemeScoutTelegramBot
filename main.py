@@ -14,6 +14,7 @@ import config
 import dexscreener_client as dex
 import filters
 import performance_tracker
+import rugcheck
 import safety_check
 import startup_check
 import storage
@@ -165,8 +166,20 @@ async def _run_chain_cycle(chain_id: str) -> None:
 
         should_alert, safety_data = safety_check.evaluate_safety(chain, addr)
         if not should_alert:
-            logger.info("[%s] %s failed safety check", chain_id, addr)
+            logger.info("[%s] %s failed GoPlus safety check", chain_id, addr)
             continue
+
+        # RugCheck (Solana-specific, second layer)
+        rc_pass, rc_data = rugcheck.evaluate_rugcheck(addr, chain)
+        if not rc_pass:
+            logger.info("[%s] %s failed RugCheck", chain_id, addr)
+            continue
+
+        # Merge rugcheck data into safety_data for the Telegram message
+        if rc_data and safety_data:
+            safety_data.update(rc_data)
+        elif rc_data:
+            safety_data = rc_data
 
         ok = await tg.send_alert(result, safety=safety_data)
         if ok:

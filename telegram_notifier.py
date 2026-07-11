@@ -127,6 +127,18 @@ def build_message(result: dict, safety: dict | None = None) -> str:
             if top10 is not None:
                 lines.append(f"Top 10 holders: {top10:.1f}%")
 
+        # RugCheck data (Solana)
+        rc_score = safety.get("rugcheck_score")
+        if rc_score is not None:
+            lp_locked = safety.get("lp_locked_pct", 0)
+            rc_risks = safety.get("risk_count", 0)
+            lines.append(f"RugCheck: {rc_score:.0%} safe | LP locked: {lp_locked:.0f}%")
+            if rc_risks > 0:
+                risk_names = safety.get("risks", [])
+                lines.append(f"Risks: {', '.join(risk_names[:3])}")
+        elif safety.get("rugcheck_unavailable"):
+            lines.append("RugCheck: unavailable")
+
     lines.append("")
     lines.append(f"Score: *{score}/100*")
 
