@@ -13,6 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 import config
 import dexscreener_client as dex
 import filters
+import holder_analysis
 import performance_tracker
 import pool_listener
 import rugcheck
@@ -190,11 +191,21 @@ async def _run_chain_cycle(chain_id: str) -> None:
             logger.info("[%s] %s failed RugCheck", chain_id, addr)
             continue
 
-        # Merge rugcheck data into safety_data for the Telegram message
+        # Holder analysis (unique buyers, whale concentration)
+        holder_pass, holder_data = holder_analysis.passes_holder_checks(addr, cfg)
+        if not holder_pass:
+            logger.info("[%s] %s failed holder analysis", chain_id, addr)
+            continue
+
+        # Merge all safety data for the Telegram message
         if rc_data and safety_data:
             safety_data.update(rc_data)
         elif rc_data:
             safety_data = rc_data
+        if holder_data and safety_data:
+            safety_data.update(holder_data)
+        elif holder_data:
+            safety_data = holder_data
 
         ok = await tg.send_alert(result, safety=safety_data)
         if ok:

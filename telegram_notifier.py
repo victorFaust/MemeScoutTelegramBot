@@ -140,6 +140,15 @@ def build_message(result: dict, safety: dict | None = None) -> str:
         elif safety.get("rugcheck_unavailable"):
             lines.append("RugCheck: unavailable")
 
+        # Holder analysis
+        unique_buyers = safety.get("unique_buyers")
+        if unique_buyers is not None:
+            quality = safety.get("buy_quality", 0)
+            top1 = safety.get("top1_pct", 0)
+            holders_min = safety.get("holder_count_min", 0)
+            lines.append(f"Holders: {holders_min}+ | Top wallet: {top1:.0f}%")
+            lines.append(f"Unique buyers: {unique_buyers} (quality: {quality:.0%})")
+
     lines.append("")
     lines.append(f"Score: *{score}/100*")
 
