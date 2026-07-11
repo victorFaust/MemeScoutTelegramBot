@@ -74,12 +74,12 @@ def build_message(result: dict, safety: dict | None = None) -> str:
     total_tx = buys + sells
     buy_ratio = f"{buys}/{sells}" if total_tx > 0 else "N/A"
 
-    # Header changes for momentum re-alerts
-    if is_momentum:
-        prev = result.get("prev_score", 0)
+    # All alerts are momentum-confirmed now
+    prev = result.get("prev_score", 0)
+    if prev and prev > 0:
         header = f"*MOMENTUM CONFIRMED*  --  Score: *{prev:.0f} -> {score}/100*"
     else:
-        header = f"*NEW MEMECOIN ALERT*  --  Score: *{score}/100*"
+        header = f"*MOMENTUM CONFIRMED*  --  Score: *{score}/100*"
 
     lines = [
         header,
