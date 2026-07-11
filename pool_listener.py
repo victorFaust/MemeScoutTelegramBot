@@ -1,7 +1,7 @@
-"""Real-time Solana new pool listener via QuickNode websocket.
+﻿"""Real-time Solana new pool listener via QuickNode HTTP RPC polling.
 
-Monitors Pump.fun and Raydium for new pool creation events.
-Alerts within seconds of pool creation, bypassing DexScreener latency.
+Polls getSignaturesForAddress on the Pump.fun program every few seconds
+to detect new pool creation transactions. Works on QuickNode free tier.
 """
 
 import asyncio
@@ -10,7 +10,6 @@ import logging
 import time
 from typing import Any, Callable
 
-import websockets
 import requests
 
 import config
@@ -20,162 +19,134 @@ logger = logging.getLogger(__name__)
 
 # Program IDs to monitor for new pools
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-RAYDIUM_AMM_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 
-# Minimum initial liquidity to consider (in SOL lamports -> rough USD estimate)
-_MIN_INITIAL_LIQUIDITY_SOL = 3.0  # ~$450 at current prices, filters dust pools
+# Polling interval (seconds)
+_POLL_INTERVAL = 8  # Check every 8 seconds
 
-# Reconnection settings
-_RECONNECT_DELAY = 5  # seconds
-_MAX_RECONNECT_DELAY = 60
-_PING_INTERVAL = 30
+# Minimum initial liquidity to consider (in SOL)
+_MIN_INITIAL_LIQUIDITY_SOL = 3.0
 
 
-def _get_wss_url() -> str:
-    """Get QuickNode websocket URL from config."""
-    url = config.QUICKNODE_WSS_URL
+def _rpc_call(method: str, params: list) -> Any:
+    """Make a Solana JSON-RPC call via QuickNode HTTP endpoint."""
+    url = config.QUICKNODE_HTTP_URL
     if not url:
-        raise RuntimeError("QUICKNODE_WSS_URL is not set in .env")
-    return url
-
-
-async def _subscribe(ws, program_id: str, sub_id: int) -> None:
-    """Send a logsSubscribe request for a program."""
-    request = {
-        "jsonrpc": "2.0",
-        "id": sub_id,
-        "method": "logsSubscribe",
-        "params": [
-            {"mentions": [program_id]},
-            {"commitment": "confirmed"}
-        ]
-    }
-    await ws.send(json.dumps(request))
-    logger.info("[WS] Subscribed to program %s (id=%d)", program_id[:8], sub_id)
-
-
-def _parse_pool_creation(log_data: dict) -> dict | None:
-    """Parse a log notification to detect new pool creation.
-    
-    Returns token info dict if this is a new pool, None otherwise.
-    """
-    value = log_data.get("value", {})
-    logs = value.get("logs", [])
-    signature = value.get("signature", "")
-
-    # Pump.fun: look for "Program log: Initialize" or pool creation patterns
-    is_new_pool = False
-    for log_line in logs:
-        if any(kw in log_line for kw in [
-            "InitializePool",
-            "Initialize",
-            "init_pc_amount",
-            "initialize2",
-            "create",
-        ]):
-            is_new_pool = True
-            break
-
-    if not is_new_pool:
         return None
-
-    # Extract account keys from the transaction
-    err = value.get("err")
-    if err is not None:
-        return None  # Failed transaction
-
-    return {
-        "signature": signature,
-        "logs": logs,
-        "detected_at": time.time(),
-    }
-
-
-async def _fetch_transaction_details(signature: str) -> dict | None:
-    """Fetch full transaction details via QuickNode REST to get token addresses."""
-    url = config.QUICKNODE_WSS_URL.replace("wss://", "https://").rstrip("/")
     try:
         resp = requests.post(url, json={
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "getTransaction",
-            "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            "method": method,
+            "params": params,
         }, timeout=10)
+        resp.raise_for_status()
         data = resp.json()
-        result = data.get("result")
-        if not result:
+        if "error" in data:
+            logger.error("[POOL] RPC error (%s): %s", method, data["error"])
             return None
-        return result
-    except Exception as e:
-        logger.error("[WS] Failed to fetch tx details for %s: %s", signature[:16], e)
+        return data.get("result")
+    except requests.RequestException as e:
+        logger.error("[POOL] RPC request failed (%s): %s", method, e)
         return None
+
+
+def _get_recent_signatures(program_id: str, limit: int = 10, before: str | None = None) -> list[dict]:
+    """Get recent transaction signatures for a program."""
+    params: list = [program_id, {"limit": limit, "commitment": "confirmed"}]
+    if before:
+        params[1]["before"] = before
+    result = _rpc_call("getSignaturesForAddress", params)
+    return result if result else []
+
+
+def _fetch_transaction(signature: str) -> dict | None:
+    """Fetch a parsed transaction by signature."""
+    result = _rpc_call("getTransaction", [
+        signature,
+        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+    ])
+    return result
+
+
+def _is_pool_creation(tx_data: dict) -> bool:
+    """Check if a transaction is a pool/token creation (not just a swap)."""
+    if not tx_data:
+        return False
+    meta = tx_data.get("meta", {})
+    if meta.get("err"):
+        return False
+
+    logs = meta.get("logMessages", [])
+    for log_line in logs:
+        if any(kw in log_line for kw in [
+            "Program log: Instruction: Create",
+            "Program log: Instruction: Initialize",
+            "InitializeMint",
+        ]):
+            return True
+    return False
 
 
 def _extract_token_from_tx(tx_data: dict) -> dict | None:
     """Extract the new token mint address and initial liquidity from a parsed transaction."""
     meta = tx_data.get("meta", {})
-    if meta.get("err") is not None:
-        return None
-
     message = tx_data.get("transaction", {}).get("message", {})
-    instructions = message.get("instructions", [])
     inner_instructions = meta.get("innerInstructions", [])
-
-    # Look for token mint in account keys
+    instructions = message.get("instructions", [])
     account_keys = message.get("accountKeys", [])
 
-    # Find SPL token mints involved (look for initializeMint or token creation)
     token_mint = None
+
+    # Look for initializeMint in inner instructions
     for ix_group in inner_instructions:
         for ix in ix_group.get("instructions", []):
             parsed = ix.get("parsed", {})
             if isinstance(parsed, dict):
                 ix_type = parsed.get("type", "")
-                info = parsed.get("info", {})
                 if ix_type in ("initializeMint", "initializeMint2"):
-                    token_mint = info.get("mint")
-                elif ix_type == "transfer" and not token_mint:
-                    # Track SOL transfers to estimate liquidity
-                    pass
+                    token_mint = parsed.get("info", {}).get("mint")
+                    break
+        if token_mint:
+            break
 
     # Also check top-level instructions
-    for ix in instructions:
-        parsed = ix.get("parsed", {})
-        if isinstance(parsed, dict):
-            if parsed.get("type") in ("initializeMint", "initializeMint2"):
-                token_mint = parsed.get("info", {}).get("mint")
-
-    # Estimate initial liquidity from SOL balance changes
-    pre_balances = meta.get("preBalances", [])
-    post_balances = meta.get("postBalances", [])
-    sol_deposited = 0
-    if pre_balances and post_balances:
-        # Find the largest SOL deposit (likely the pool's initial liquidity)
-        for pre, post in zip(pre_balances, post_balances):
-            diff = (post - pre) / 1e9  # lamports to SOL
-            if diff > sol_deposited:
-                sol_deposited = diff
-
     if not token_mint:
-        # Try to find mint from account keys (heuristic: non-system, non-program addresses)
+        for ix in instructions:
+            parsed = ix.get("parsed", {})
+            if isinstance(parsed, dict):
+                if parsed.get("type") in ("initializeMint", "initializeMint2"):
+                    token_mint = parsed.get("info", {}).get("mint")
+                    break
+
+    # Fallback: find non-system addresses in account keys
+    if not token_mint:
         system_programs = {
             "11111111111111111111111111111111",
             "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
             "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
             PUMP_FUN_PROGRAM,
-            RAYDIUM_AMM_PROGRAM,
             "SysvarRent111111111111111111111111111111111",
             "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+            "ComputeBudget111111111111111111111111111111",
         }
         for key in account_keys:
-            addr = key.get("pubkey", key) if isinstance(key, dict) else key
-            if addr not in system_programs and len(addr) > 30:
-                # Heuristic: first non-system key that looks like a mint
+            addr = key.get("pubkey", key) if isinstance(key, dict) else str(key)
+            if addr not in system_programs and len(addr) > 30 and addr.endswith("pump"):
                 token_mint = addr
                 break
 
     if not token_mint:
         return None
+
+    # Estimate SOL deposited from balance changes
+    pre_balances = meta.get("preBalances", [])
+    post_balances = meta.get("postBalances", [])
+    sol_deposited = 0.0
+    if pre_balances and post_balances:
+        for pre, post in zip(pre_balances, post_balances):
+            diff = (post - pre) / 1e9
+            if diff > sol_deposited:
+                sol_deposited = diff
 
     return {
         "token_address": token_mint,
@@ -185,129 +156,96 @@ def _extract_token_from_tx(tx_data: dict) -> dict | None:
 
 
 class PoolListener:
-    """Async websocket listener for new Solana pool creation events."""
+    """HTTP polling-based listener for new Solana pool creation events."""
 
     def __init__(self, on_new_pool: Callable):
-        """
-        Args:
-            on_new_pool: async callback(token_info: dict) called when a new pool is detected.
-        """
         self._on_new_pool = on_new_pool
         self._running = False
-        self._seen_signatures: set = set()  # dedup within session
-        self._max_seen = 10000
+        self._last_signature: str | None = None
+        self._seen_signatures: set = set()
 
     async def start(self) -> None:
-        """Start listening. Reconnects automatically on disconnect."""
+        """Start polling loop."""
         self._running = True
-        delay = _RECONNECT_DELAY
+        logger.info("[POOL] Starting Pump.fun pool poller (interval=%ds)", _POLL_INTERVAL)
+
+        # Initialize: get the latest signature so we only process NEW ones
+        sigs = _get_recent_signatures(PUMP_FUN_PROGRAM, limit=1)
+        if sigs:
+            self._last_signature = sigs[0].get("signature")
+            logger.info("[POOL] Initialized -- latest sig: %s", self._last_signature[:16] if self._last_signature else "none")
 
         while self._running:
             try:
-                await self._listen()
-                logger.warning("[WS] Connection ended cleanly (no error). Reconnecting in %ds...", delay)
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.warning("[WS] Connection closed: code=%s reason='%s'. Reconnecting in %ds...",
-                               e.code, e.reason, delay)
+                await self._poll_cycle()
             except Exception as e:
-                logger.error("[WS] Unexpected error: %s (%s). Reconnecting in %ds...",
-                             e, type(e).__name__, delay)
+                logger.error("[POOL] Error in poll cycle: %s", e)
 
-            if self._running:
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, _MAX_RECONNECT_DELAY)
+            await asyncio.sleep(_POLL_INTERVAL)
 
     def stop(self) -> None:
         self._running = False
 
-    async def _listen(self) -> None:
-        """Connect to websocket and process messages."""
-        url = _get_wss_url()
-        logger.info("[WS] Connecting to QuickNode websocket...")
+    async def _poll_cycle(self) -> None:
+        """Check for new Pump.fun transactions since last poll."""
+        sigs = await asyncio.to_thread(
+            _get_recent_signatures, PUMP_FUN_PROGRAM, 5
+        )
 
-        async with websockets.connect(
-            url,
-            ping_interval=_PING_INTERVAL,
-            ping_timeout=10,
-            max_size=2**20,  # 1MB max message size
-            close_timeout=5,
-        ) as ws:
-            # Only subscribe to Pump.fun (Raydium generates too much volume for free tier)
-            logger.info("[WS] Connected. Subscribing to Pump.fun...")
-            await _subscribe(ws, PUMP_FUN_PROGRAM, 1)
-
-            # Wait for subscription confirmation
-            msg_count = 0
-            async for message in ws:
-                msg_count += 1
-                try:
-                    data = json.loads(message)
-                    await self._handle_message(data)
-                except json.JSONDecodeError:
-                    logger.debug("[WS] Non-JSON message: %s", message[:100])
-                    continue
-                except Exception as e:
-                    logger.error("[WS] Error processing message: %s", e)
-
-            # If we get here, the loop ended (connection closed)
-            logger.warning("[WS] Message loop ended after %d messages", msg_count)
-
-    async def _handle_message(self, data: dict) -> None:
-        """Process a websocket message."""
-        # Subscription confirmations
-        if "result" in data and "id" in data:
-            logger.debug("[WS] Subscription confirmed: id=%d", data["id"])
+        if not sigs:
             return
 
-        # Log notifications
-        method = data.get("method")
-        if method != "logsNotification":
+        # Process new signatures (newest first, stop at last seen)
+        new_sigs = []
+        for sig_info in sigs:
+            sig = sig_info.get("signature", "")
+            if sig == self._last_signature or sig in self._seen_signatures:
+                break
+            new_sigs.append(sig)
+
+        if not new_sigs:
             return
 
-        params = data.get("params", {})
-        result = params.get("result", {})
-        pool_event = _parse_pool_creation(result)
+        # Update last seen
+        self._last_signature = sigs[0].get("signature")
 
-        if pool_event is None:
-            return
+        logger.info("[POOL] Found %d new Pump.fun transactions", len(new_sigs))
 
-        sig = pool_event["signature"]
-        if sig in self._seen_signatures:
-            return
-        self._seen_signatures.add(sig)
+        # Process each new signature (limit to 3 per cycle to stay within rate limits)
+        for sig in new_sigs[:3]:
+            self._seen_signatures.add(sig)
+            await self._process_signature(sig)
 
-        # Trim seen set if too large
-        if len(self._seen_signatures) > self._max_seen:
-            self._seen_signatures = set(list(self._seen_signatures)[-5000:])
+        # Trim seen set
+        if len(self._seen_signatures) > 5000:
+            self._seen_signatures = set(list(self._seen_signatures)[-2500:])
 
-        logger.info("[WS] New pool detected! sig=%s", sig[:24])
-
-        # Fetch full transaction to get token address
-        tx_data = await asyncio.to_thread(_fetch_transaction_details, sig)
-
+    async def _process_signature(self, signature: str) -> None:
+        """Fetch and process a single transaction."""
+        tx_data = await asyncio.to_thread(_fetch_transaction, signature)
         if tx_data is None:
-            logger.debug("[WS] Could not fetch tx details for %s", sig[:16])
+            return
+
+        if not _is_pool_creation(tx_data):
             return
 
         token_info = _extract_token_from_tx(tx_data)
         if token_info is None:
-            logger.debug("[WS] Could not extract token from tx %s", sig[:16])
             return
 
         # Filter: minimum SOL deposited
         if token_info["sol_deposited"] < _MIN_INITIAL_LIQUIDITY_SOL:
-            logger.debug("[WS] Skipping %s -- low liquidity (%.2f SOL)",
+            logger.debug("[POOL] Skipping %s -- low liquidity (%.2f SOL)",
                          token_info["token_address"][:16], token_info["sol_deposited"])
             return
 
-        token_info["signature"] = sig
-        token_info["detected_at"] = pool_event["detected_at"]
+        token_info["signature"] = signature
+        token_info["detected_at"] = time.time()
 
-        logger.info("[WS] New pool: token=%s, liquidity=%.1f SOL",
+        logger.info("[POOL] New pool: token=%s, liquidity=%.1f SOL",
                     token_info["token_address"][:16], token_info["sol_deposited"])
 
-        # Call the handler
         try:
             await self._on_new_pool(token_info)
         except Exception as e:
-            logger.error("[WS] Error in new pool handler: %s", e)
+            logger.error("[POOL] Error in new pool handler: %s", e)
