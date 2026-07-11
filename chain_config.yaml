@@ -50,6 +50,7 @@ solana:
   min_lp_locked_pct: 80
   max_top1_holder_pct: 30
   min_buy_quality: 0.3
+  reject_serial_deployers: true
 
   weights:
     liquidity: 12
