@@ -19,5 +19,11 @@ services:
         value: "true"
       - key: LOG_FILE
         value: /tmp/bot.log
+      - key: DB_PATH
+        value: /var/data/alerts.db
       - key: PYTHON_VERSION
         value: "3.12.0"
+    disk:
+      name: memescout-data
+      mountPath: /var/data
+      sizeGB: 1
