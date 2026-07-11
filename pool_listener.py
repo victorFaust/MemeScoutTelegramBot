@@ -270,9 +270,7 @@ class PoolListener:
         logger.info("[WS] New pool detected! sig=%s", sig[:24])
 
         # Fetch full transaction to get token address
-        tx_data = await asyncio.get_event_loop().run_in_executor(
-            None, _fetch_transaction_details, sig
-        )
+        tx_data = await asyncio.to_thread(_fetch_transaction_details, sig)
 
         if tx_data is None:
             logger.debug("[WS] Could not fetch tx details for %s", sig[:16])
