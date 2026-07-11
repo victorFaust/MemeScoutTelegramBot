@@ -15,6 +15,7 @@ import dexscreener_client as dex
 import filters
 import performance_tracker
 import safety_check
+import startup_check
 import storage
 import telegram_notifier as tg
 
@@ -198,8 +199,12 @@ async def _cleanup_loop() -> None:
 
 async def main() -> None:
     _setup_logging()
+
+    # Run startup self-checks (hard failures will exit the process)
+    startup_check.run_startup_checks()
+
     logger.info("=" * 60)
-    logger.info("MemeScout Bot starting")
+    logger.info("MemeScout Bot starting schedulers")
     logger.info("=" * 60)
 
     # Log per-chain config at startup
