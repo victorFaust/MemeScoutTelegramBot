@@ -53,8 +53,8 @@ DAILY_LOSS_LIMIT_SOL: float = _float("DAILY_LOSS_LIMIT_SOL", 1.0)
 TRADE_SLIPPAGE_BPS: int = _int("TRADE_SLIPPAGE_BPS", 500)  # 5% default slippage
 TRADING_ENABLED: bool = os.getenv("TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
 TAKE_PROFIT_PCT: float = _float("TAKE_PROFIT_PCT", 100.0)  # Sell at +100% (2x)
-STOP_LOSS_PCT: float = _float("STOP_LOSS_PCT", -30.0)      # Sell at -30%
-EXIT_CHECK_INTERVAL: int = _int("EXIT_CHECK_INTERVAL", 30)  # Check exits every 30s
+STOP_LOSS_PCT: float = _float("STOP_LOSS_PCT", -20.0)      # Sell at -20%
+EXIT_CHECK_INTERVAL: int = _int("EXIT_CHECK_INTERVAL", 15)  # Check exits every 15s
 
 # Auto-buy (fully autonomous mode)
 AUTO_BUY_ENABLED: bool = os.getenv("AUTO_BUY_ENABLED", "false").lower() in ("1", "true", "yes")
