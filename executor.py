@@ -313,6 +313,21 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
     # Track spending
     _daily_spent_sol += amount_sol
 
+    # Get entry price and MC from DexScreener at buy time
+    entry_price_usd = None
+    entry_mc = None
+    token_symbol = ""
+    try:
+        import dexscreener_client as dex
+        pairs = dex.fetch_pair_details("solana", token_mint)
+        if pairs:
+            p = pairs[0]
+            entry_price_usd = float(p.get("priceUsd", 0) or 0)
+            entry_mc = p.get("marketCap") or p.get("fdv") or 0
+            token_symbol = (p.get("baseToken") or {}).get("symbol", "")
+    except Exception as e:
+        logger.debug("[TRADE] Could not fetch entry price: %s", e)
+
     # Record position
     out_amount = int(quote.get("outAmount", "0") or "0")
     storage.record_position(
@@ -321,6 +336,9 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
         buy_amount_sol=amount_sol,
         token_amount=out_amount,
         buy_signature=result["signature"],
+        entry_price_usd=entry_price_usd,
+        entry_mc=entry_mc,
+        token_symbol=token_symbol,
     )
 
     result["amount_sol"] = amount_sol

@@ -237,37 +237,40 @@ async def _handle_positions_command(update: Update, context: ContextTypes.DEFAUL
             pnl_sol = pnl["pnl_sol"]
             total_current += current_val
 
-            # Get current MC from DexScreener
+            # Get current MC + price from DexScreener
             import dexscreener_client as dex
             pairs = await asyncio.to_thread(dex.fetch_pair_details, "solana", token_addr)
             current_mc = 0
-            symbol = token_addr[:8]
+            current_price_usd = 0.0
+            symbol = p.get("token_symbol") or token_addr[:8]
             if pairs:
                 current_mc = pairs[0].get("marketCap") or pairs[0].get("fdv") or 0
+                current_price_usd = float(pairs[0].get("priceUsd", 0) or 0)
                 base = pairs[0].get("baseToken", {})
-                symbol = base.get("symbol", token_addr[:8])
+                symbol = base.get("symbol", symbol)
 
-            # Estimate entry MC and prices from ratio
-            if current_val > 0 and amount_sol > 0:
-                entry_mc = current_mc * (amount_sol / current_val) if current_mc else 0
-            else:
-                entry_mc = 0
-
-            # Calculate entry price and current price per token
-            entry_price = amount_sol / token_amount if token_amount > 0 else 0
-            current_price = current_val / token_amount if token_amount > 0 else 0
-            sol_price = executor.get_sol_price()
-            entry_price_usd = entry_price * sol_price
-            current_price_usd = current_price * sol_price
+            # Use stored entry MC and price (fixed at buy time)
+            entry_mc = p.get("entry_mc", 0) or 0
+            entry_price_usd = p.get("entry_price_usd", 0) or 0
 
             sign = "+" if pnl_pct >= 0 else ""
             mc_str = f"${current_mc/1000:.0f}K" if current_mc >= 1000 else f"${current_mc:.0f}"
             entry_mc_str = f"${entry_mc/1000:.0f}K" if entry_mc >= 1000 else f"${entry_mc:.0f}"
 
+            # Format prices (handle very small numbers)
+            def _fmt_price(p):
+                if p <= 0:
+                    return "N/A"
+                if p < 0.0001:
+                    return f"${p:.10f}"
+                if p < 0.01:
+                    return f"${p:.6f}"
+                return f"${p:.4f}"
+
             lines.append(
                 f"{i+1}. ${symbol} (#{pos_id})\n"
                 f"   Entry: {entry_mc_str} MC | Now: {mc_str} MC\n"
-                f"   Buy price: ${entry_price_usd:.8f} | Now: ${current_price_usd:.8f}\n"
+                f"   Buy: {_fmt_price(entry_price_usd)} | Now: {_fmt_price(current_price_usd)}\n"
                 f"   PnL: {sign}{pnl_pct:.0f}% ({sign}{pnl_sol:.4f} SOL)\n"
                 f"   Value: {current_val:.4f} SOL"
             )

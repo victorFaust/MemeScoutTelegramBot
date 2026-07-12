@@ -76,7 +76,10 @@ CREATE TABLE IF NOT EXISTS positions (
     bought_at       REAL NOT NULL,
     sold_at         REAL,
     sell_amount_sol REAL,
-    status          TEXT DEFAULT 'open'
+    status          TEXT DEFAULT 'open',
+    entry_price_usd REAL,
+    entry_mc        REAL,
+    token_symbol    TEXT
 );
 """
 
@@ -328,14 +331,18 @@ def cleanup_stale_metrics(hours: int = 24) -> None:
 def record_position(
     token_address: str, chain_id: str, buy_amount_sol: float,
     token_amount: int, buy_signature: str,
+    entry_price_usd: float | None = None, entry_mc: float | None = None,
+    token_symbol: str = "",
 ) -> None:
-    """Record a new open position."""
+    """Record a new open position with entry price and MC."""
     conn = _connect()
     try:
         conn.execute(
-            """INSERT INTO positions (token_address, chain_id, buy_amount_sol, token_amount, buy_signature, bought_at, status)
-               VALUES (?, ?, ?, ?, ?, ?, 'open')""",
-            (token_address, chain_id, buy_amount_sol, token_amount, buy_signature, time.time()),
+            """INSERT INTO positions (token_address, chain_id, buy_amount_sol, token_amount,
+               buy_signature, bought_at, status, entry_price_usd, entry_mc, token_symbol)
+               VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
+            (token_address, chain_id, buy_amount_sol, token_amount, buy_signature,
+             time.time(), entry_price_usd, entry_mc, token_symbol),
         )
         conn.commit()
     finally:
