@@ -162,17 +162,34 @@ def build_message(result: dict, safety: dict | None = None) -> str:
 
 
 async def send_alert(result: dict, safety: dict | None = None) -> bool:
-    """Send a single alert message. Returns True on success."""
+    """Send a single alert message with optional buy button. Returns True on success."""
     if not config.TELEGRAM_CHAT_ID:
         logger.error("TELEGRAM_CHAT_ID is not set -- skipping alert")
         return False
     text = build_message(result, safety)
+
+    # Add buy button if trading is enabled
+    reply_markup = None
+    if config.TRADING_ENABLED:
+        pair = result.get("pair", {})
+        base = pair.get("baseToken", {})
+        token_addr = base.get("address", "")
+        if token_addr:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            reply_markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"Buy {config.TRADE_AMOUNT_SOL} SOL",
+                    callback_data=f"buy:{token_addr}"
+                ),
+            ]])
+
     try:
         bot = _get_bot()
         await bot.send_message(
             chat_id=config.TELEGRAM_CHAT_ID,
             text=text,
             parse_mode=telegram.constants.ParseMode.MARKDOWN,
+            reply_markup=reply_markup,
         )
         logger.info("Sent alert for %s", _safe(result, "pair", "baseToken", "symbol", default="?"))
         return True
@@ -214,12 +231,25 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
     lines.append("_Early detection -- DYOR, no score yet_")
 
     text = "\n".join(lines)
+
+    # Add buy button if trading is enabled
+    reply_markup = None
+    if config.TRADING_ENABLED and token_addr:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"Buy {config.TRADE_AMOUNT_SOL} SOL",
+                callback_data=f"buy:{token_addr}"
+            ),
+        ]])
+
     try:
         bot = _get_bot()
         await bot.send_message(
             chat_id=config.TELEGRAM_CHAT_ID,
             text=text,
             parse_mode=telegram.constants.ParseMode.MARKDOWN,
+            reply_markup=reply_markup,
         )
         return True
     except Exception:

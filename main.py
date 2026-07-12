@@ -16,6 +16,7 @@ import filters
 import holder_analysis
 import performance_tracker
 import pool_listener
+import bot_handler
 import rugcheck
 import safety_check
 import startup_check
@@ -371,6 +372,9 @@ async def main() -> None:
         logger.info("[POOL] Pump.fun pool poller started")
     else:
         logger.warning("[POOL] QUICKNODE_HTTP_URL not set -- pool detection disabled")
+
+    # Start Telegram bot handler (for buy buttons + commands)
+    asyncio.create_task(bot_handler.start_bot_handler())
 
     # Keep the event loop alive
     try:
