@@ -301,6 +301,15 @@ async def _handle_new_pool(token_info: dict) -> None:
         logger.debug("[POOL] %s -- only %d txns after 90s, skipping", token_address[:16], total_txns)
         return
 
+    # Holder analysis (unique buyers check -- uses QuickNode/Shyft)
+    cfg = config.get_chain_profile(chain_id)
+    holder_pass, holder_data = await asyncio.to_thread(
+        holder_analysis.passes_holder_checks, token_address, cfg
+    )
+    if not holder_pass:
+        logger.info("[POOL] %s failed holder analysis -- skipping", token_address[:16])
+        return
+
     # Build alert with real data from DexScreener
     latency = time.time() - token_info.get("detected_at", time.time())
     token_info["pair_data"] = pair
@@ -313,7 +322,7 @@ async def _handle_new_pool(token_info: dict) -> None:
     token_info["symbol"] = symbol
 
     # Send alert
-    ok = await tg.send_new_pool_alert(token_info, rc_data)
+    ok = await tg.send_new_pool_alert(token_info, rc_data if not holder_data else {**(rc_data or {}), **holder_data})
     if ok:
         storage.record_alert(chain_id, token_address, 0)
         logger.info("[POOL] Alert sent: %s ($%s) | %.1f SOL | %d txns in 90s",

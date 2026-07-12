@@ -19,28 +19,33 @@ logger = logging.getLogger(__name__)
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 # Polling interval (seconds)
-_POLL_INTERVAL = 30
-_BACKOFF_INTERVAL = 60
+# Polling interval -- use premium RPCs for speed
+_POLL_INTERVAL = 8   # 8 seconds (QuickNode/Shyft can handle this)
+_BACKOFF_INTERVAL = 30
 
 # Minimum initial liquidity to consider (in SOL)
 _MIN_INITIAL_LIQUIDITY_SOL = 3.0
 
 
-def _get_recent_signatures(program_id: str, limit: int = 10, before: str | None = None) -> list[dict]:
-    """Get recent transaction signatures for a program."""
+def _get_recent_signatures(program_id: str, limit: int = 20, before: str | None = None) -> list[dict]:
+    """Get recent transaction signatures. Uses premium RPC for speed."""
     params: list = [program_id, {"limit": limit, "commitment": "confirmed"}]
     if before:
         params[1]["before"] = before
-    result = rpc_client.rpc_call("getSignaturesForAddress", params, tier="public")
+    # Use premium RPCs (QuickNode/Shyft) -- they're faster and more reliable
+    result = rpc_client.rpc_call("getSignaturesForAddress", params, tier="premium")
+    if result is None:
+        # Fallback to public if premium is rate-limited
+        result = rpc_client.rpc_call("getSignaturesForAddress", params, tier="public")
     return result if result else []
 
 
 def _fetch_transaction(signature: str) -> dict | None:
-    """Fetch a parsed transaction by signature. Uses any available provider."""
+    """Fetch a parsed transaction. Uses premium RPC."""
     result = rpc_client.rpc_call("getTransaction", [
         signature,
         {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-    ])
+    ], tier="premium")
     return result
 
 
@@ -177,7 +182,7 @@ class PoolListener:
     async def _poll_cycle(self) -> None:
         """Check for new Pump.fun transactions since last poll."""
         sigs = await asyncio.to_thread(
-            _get_recent_signatures, PUMP_FUN_PROGRAM, 5
+            _get_recent_signatures, PUMP_FUN_PROGRAM, 20
         )
 
         if not sigs:
@@ -203,11 +208,11 @@ class PoolListener:
 
         logger.info("[POOL] Found %d new Pump.fun transactions", len(new_sigs))
 
-        # Process each new signature (limit to 2 per cycle to conserve QuickNode credits)
-        for sig in new_sigs[:2]:
+        # Process new signatures (up to 5 per cycle with premium RPCs)
+        for sig in new_sigs[:5]:
             self._seen_signatures.add(sig)
             await self._process_signature(sig)
-            await asyncio.sleep(1)  # Small delay between tx fetches
+            await asyncio.sleep(0.5)
 
         # Trim seen set
         if len(self._seen_signatures) > 5000:
