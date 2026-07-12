@@ -124,10 +124,12 @@ async def _run_chain_cycle(chain_id: str) -> None:
 
     logger.info("[%s] Fetched %d pairs", chain_id, len(all_pairs))
 
-    scored = filters.filter_and_score(all_pairs)
-    logger.info("[%s] %d pairs passed scoring", chain_id, len(scored))
+    # Score ALL pairs (including below threshold) for momentum tracking
+    scored = filters.filter_and_score(all_pairs, min_score=0)
+    above_threshold = [r for r in scored if r["score"] >= (config.get_chain_profile(chain_id).get("min_alert_score", 40))]
+    logger.info("[%s] %d scored, %d above threshold", chain_id, len(scored), len(above_threshold))
 
-    # Store metrics for velocity tracking (all pairs that passed hard filters)
+    # Store metrics for ALL scored pairs (enables momentum detection)
     for result in scored:
         pair = result["pair"]
         base = pair.get("baseToken") or {}
@@ -144,9 +146,10 @@ async def _run_chain_cycle(chain_id: str) -> None:
 
     sent = 0
     cfg = config.get_chain_profile(chain_id)
-    momentum_threshold = cfg.get("momentum_realert_threshold", 15)
+    momentum_threshold = cfg.get("momentum_realert_threshold", 8)
 
-    for result in scored:
+    # Only process tokens above the alert threshold for actual alerts
+    for result in above_threshold:
         pair = result["pair"]
         chain = (pair.get("chainId") or "").lower()
         base = pair.get("baseToken") or {}

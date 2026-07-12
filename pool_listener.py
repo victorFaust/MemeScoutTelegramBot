@@ -24,7 +24,7 @@ _POLL_INTERVAL = 8   # 8 seconds (QuickNode/Shyft can handle this)
 _BACKOFF_INTERVAL = 30
 
 # Minimum initial liquidity to consider (in SOL)
-_MIN_INITIAL_LIQUIDITY_SOL = 3.0
+_MIN_INITIAL_LIQUIDITY_SOL = 1.5
 
 
 def _get_recent_signatures(program_id: str, limit: int = 20, before: str | None = None) -> list[dict]:
@@ -50,7 +50,10 @@ def _fetch_transaction(signature: str) -> dict | None:
 
 
 def _is_pool_creation(tx_data: dict) -> bool:
-    """Check if a transaction is a pool/token creation (not just a swap)."""
+    """Check if a transaction is a pool/token creation (not just a swap).
+    
+    Pump.fun token creation logs include various patterns depending on version.
+    """
     if not tx_data:
         return False
     meta = tx_data.get("meta", {})
@@ -58,13 +61,27 @@ def _is_pool_creation(tx_data: dict) -> bool:
         return False
 
     logs = meta.get("logMessages", [])
+    creation_keywords = [
+        "Program log: Instruction: Create",
+        "Program log: Instruction: Initialize",
+        "InitializeMint",
+        "Program log: create",
+        "invoke [1]",  # Pump.fun direct invocation (creation)
+    ]
+
+    # Pump.fun creates have initializeMint in inner instructions
+    inner = meta.get("innerInstructions", [])
+    for group in inner:
+        for ix in group.get("instructions", []):
+            parsed = ix.get("parsed", {})
+            if isinstance(parsed, dict) and parsed.get("type") in ("initializeMint", "initializeMint2"):
+                return True
+
+    # Also check log messages
     for log_line in logs:
-        if any(kw in log_line for kw in [
-            "Program log: Instruction: Create",
-            "Program log: Instruction: Initialize",
-            "InitializeMint",
-        ]):
+        if any(kw in log_line for kw in creation_keywords):
             return True
+
     return False
 
 
@@ -222,6 +239,7 @@ class PoolListener:
         """Fetch and process a single transaction."""
         tx_data = await asyncio.to_thread(_fetch_transaction, signature)
         if tx_data is None:
+            logger.debug("[POOL] Failed to fetch tx: %s", signature[:16])
             return
 
         if not _is_pool_creation(tx_data):
@@ -229,12 +247,13 @@ class PoolListener:
 
         token_info = _extract_token_from_tx(tx_data)
         if token_info is None:
+            logger.debug("[POOL] Could not extract token from creation tx: %s", signature[:16])
             return
 
-        # Filter: minimum SOL deposited
+        # Filter: minimum SOL deposited (lowered to 1.5 SOL to catch more)
         if token_info["sol_deposited"] < _MIN_INITIAL_LIQUIDITY_SOL:
-            logger.debug("[POOL] Skipping %s -- low liquidity (%.2f SOL)",
-                         token_info["token_address"][:16], token_info["sol_deposited"])
+            logger.info("[POOL] Skipping %s -- low liquidity (%.2f SOL)",
+                        token_info["token_address"][:16], token_info["sol_deposited"])
             return
 
         token_info["signature"] = signature
