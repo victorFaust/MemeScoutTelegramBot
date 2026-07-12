@@ -60,6 +60,29 @@ def usd_to_sol(usd_amount: float) -> float:
     return usd_amount / price if price > 0 else 0.0
 
 
+def get_wallet_balance() -> dict | None:
+    """Get SOL balance of the trading wallet."""
+    wallet = get_wallet_address()
+    if not wallet:
+        return None
+    rpc_url = config.QUICKNODE_HTTP_URL or "https://api.mainnet-beta.solana.com"
+    try:
+        resp = requests.post(rpc_url, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getBalance",
+            "params": [wallet],
+        }, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        lamports = data.get("result", {}).get("value", 0)
+        sol = lamports / LAMPORTS_PER_SOL
+        usd = sol * get_sol_price()
+        return {"sol": round(sol, 4), "usd": round(usd, 2)}
+    except Exception as e:
+        logger.warning("[TRADE] Failed to fetch wallet balance: %s", e)
+        return None
+
+
 def _reset_daily_if_needed() -> None:
     """Reset daily spending counter at midnight UTC."""
     global _daily_spent_sol, _daily_reset_time
