@@ -182,14 +182,20 @@ async def _handle_status_command(update: Update, context: ContextTypes.DEFAULT_T
     allowed, reason = executor.can_trade()
     wallet = executor.get_wallet_address()
     positions = storage.get_open_positions_count()
+    balance = executor.get_wallet_balance()
 
     wallet_str = f"{wallet[:8]}...{wallet[-4:]}" if wallet else "not configured"
+    if balance:
+        balance_str = f"{balance['sol']} SOL (${balance['usd']:.2f})"
+    else:
+        balance_str = "unavailable"
 
     lines = [
         f"Trading: {'ENABLED' if config.TRADING_ENABLED else 'DISABLED'}",
         f"Auto-buy: {'ON' if config.AUTO_BUY_ENABLED else 'OFF'} (${config.AUTO_BUY_AMOUNT_USD:.0f})",
         f"Auto-buy pools: {'ON' if config.AUTO_BUY_NEW_POOLS else 'OFF'}",
         f"Wallet: {wallet_str}",
+        f"Balance: {balance_str}",
         f"Open positions: {positions}/{config.MAX_OPEN_POSITIONS}",
         f"TP: +{config.TAKE_PROFIT_PCT:.0f}% / SL: {config.STOP_LOSS_PCT:.0f}%",
         f"Daily limit: {config.DAILY_LOSS_LIMIT_SOL} SOL",
