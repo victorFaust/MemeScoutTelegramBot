@@ -1,4 +1,4 @@
-"""Holder analysis via QuickNode Solana RPC.
+"""Holder analysis via Solana RPC (QuickNode + Shyft load balanced).
 
 Checks unique holder count, top holder concentration, unique recent buyers,
 and deployer wallet history to filter wash-traded or insider-heavy tokens.
@@ -8,8 +8,7 @@ import logging
 import time
 from typing import Any
 
-import requests
-
+import rpc_client
 import config
 import storage
 
@@ -17,26 +16,8 @@ logger = logging.getLogger(__name__)
 
 
 def _rpc_call(method: str, params: list) -> dict | None:
-    """Make a Solana JSON-RPC call via QuickNode HTTP endpoint."""
-    url = config.QUICKNODE_HTTP_URL
-    if not url:
-        return None
-    try:
-        resp = requests.post(url, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        }, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            logger.error("RPC error (%s): %s", method, data["error"])
-            return None
-        return data.get("result")
-    except requests.RequestException as e:
-        logger.error("RPC request failed (%s): %s", method, e)
-        return None
+    """Make a Solana RPC call via premium providers (QuickNode/Shyft)."""
+    return rpc_client.rpc_call(method, params, tier="premium")
 
 
 def get_holder_count(token_mint: str) -> int | None:

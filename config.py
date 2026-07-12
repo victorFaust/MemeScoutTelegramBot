@@ -38,9 +38,12 @@ DEDUP_COOLDOWN_HOURS: float = _float("DEDUP_COOLDOWN_HOURS", 6)
 SAFETY_CHECK_CACHE_HOURS: float = _float("SAFETY_CHECK_CACHE_HOURS", 1)
 SKIP_ON_SAFETY_CHECK_FAILURE: bool = os.getenv("SKIP_ON_SAFETY_CHECK_FAILURE", "true").lower() in ("1", "true", "yes")
 
-# QuickNode Solana websocket
+# QuickNode Solana
 QUICKNODE_WSS_URL: str = os.getenv("QUICKNODE_WSS_URL", "")
 QUICKNODE_HTTP_URL: str = os.getenv("QUICKNODE_HTTP_URL", "")
+
+# Shyft Solana
+SHYFT_HTTP_URL: str = os.getenv("SHYFT_HTTP_URL", "")
 
 # Trading (Jupiter swap)
 TRADING_WALLET_PRIVATE_KEY: str = os.getenv("TRADING_WALLET_PRIVATE_KEY", "")
