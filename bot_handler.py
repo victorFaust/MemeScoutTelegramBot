@@ -207,25 +207,81 @@ async def _handle_status_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _handle_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /positions command -- list open positions with PnL."""
+    """Handle /positions command -- list open positions with live PnL."""
     positions = storage.get_open_positions()
     if not positions:
         if update.message:
             await update.message.reply_text("No open positions.")
         return
 
-    lines = ["*Open Positions:*", ""]
-    for i, p in enumerate(positions):
-        token = p.get("token_address", "?")[:12]
-        amount = p.get("buy_amount_sol", 0)
-        pos_id = p.get("id", 0)
-        lines.append(f"{i+1}. `{token}...` | {amount} SOL | ID: {pos_id}")
+    if update.message:
+        await update.message.reply_text("Fetching live PnL...")
 
+    lines = ["OPEN POSITIONS", ""]
+    total_invested = 0.0
+    total_current = 0.0
+
+    for i, p in enumerate(positions):
+        token_addr = p.get("token_address", "?")
+        amount_sol = p.get("buy_amount_sol", 0)
+        pos_id = p.get("id", 0)
+        token_amount = p.get("token_amount", 0)
+        total_invested += amount_sol
+
+        # Get current value via Jupiter sell quote
+        pnl = await asyncio.to_thread(executor.check_position_pnl, p)
+
+        if pnl:
+            current_val = pnl["current_value_sol"]
+            pnl_pct = pnl["pnl_pct"]
+            pnl_sol = pnl["pnl_sol"]
+            total_current += current_val
+
+            # Get current MC from DexScreener
+            import dexscreener_client as dex
+            pairs = await asyncio.to_thread(dex.fetch_pair_details, "solana", token_addr)
+            current_mc = 0
+            symbol = token_addr[:8]
+            if pairs:
+                current_mc = pairs[0].get("marketCap") or pairs[0].get("fdv") or 0
+                base = pairs[0].get("baseToken", {})
+                symbol = base.get("symbol", token_addr[:8])
+
+            # Estimate entry MC from price ratio
+            if current_val > 0 and amount_sol > 0:
+                entry_mc = current_mc * (amount_sol / current_val) if current_mc else 0
+            else:
+                entry_mc = 0
+
+            sign = "+" if pnl_pct >= 0 else ""
+            mc_str = f"${current_mc/1000:.0f}K" if current_mc >= 1000 else f"${current_mc:.0f}"
+            entry_mc_str = f"${entry_mc/1000:.0f}K" if entry_mc >= 1000 else f"${entry_mc:.0f}"
+
+            lines.append(
+                f"{i+1}. ${symbol} (#{pos_id})\n"
+                f"   Entry: {entry_mc_str} MC | Now: {mc_str} MC\n"
+                f"   PnL: {sign}{pnl_pct:.0f}% ({sign}{pnl_sol:.4f} SOL)\n"
+                f"   Value: {current_val:.4f} SOL"
+            )
+        else:
+            lines.append(f"{i+1}. {token_addr[:12]}... (#{pos_id}) | {amount_sol} SOL | PnL: unavailable")
+
+        lines.append("")
+
+    # Summary
+    total_pnl_sol = total_current - total_invested
+    total_pnl_pct = (total_pnl_sol / total_invested * 100) if total_invested > 0 else 0
+    sign = "+" if total_pnl_pct >= 0 else ""
+
+    lines.append("---")
+    lines.append(f"Total invested: {total_invested:.4f} SOL")
+    lines.append(f"Current value: {total_current:.4f} SOL")
+    lines.append(f"Total PnL: {sign}{total_pnl_pct:.0f}% ({sign}{total_pnl_sol:.4f} SOL)")
     lines.append("")
-    lines.append("Use /sell <ID> to close a position")
+    lines.append("/sell <ID> to close | /sell to close all")
 
     if update.message:
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines))
 
 
 async def _handle_sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
