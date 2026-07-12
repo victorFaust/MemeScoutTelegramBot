@@ -285,6 +285,21 @@ async def _handle_new_pool(token_info: dict) -> None:
     if base_token.get("symbol"):
         token_info["symbol"] = base_token["symbol"]
 
+    # Holder analysis + serial deployer check
+    cfg = config.get_chain_profile(chain_id)
+    holder_pass, holder_data = await asyncio.to_thread(
+        holder_analysis.passes_holder_checks, token_address, cfg
+    )
+    if not holder_pass:
+        logger.info("[POOL] $%s failed holder analysis -- skipping", token_info.get("symbol", "?"))
+        return
+
+    # Merge holder data into rc_data for the message
+    if holder_data and rc_data:
+        rc_data.update(holder_data)
+    elif holder_data:
+        rc_data = holder_data
+
     # Send alert
     ok = await tg.send_new_pool_alert(token_info, rc_data)
     if ok:
