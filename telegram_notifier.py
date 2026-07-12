@@ -82,9 +82,13 @@ def build_message(result: dict, safety: dict | None = None) -> str:
     else:
         header = f"*MOMENTUM CONFIRMED*  --  Score: *{score}/100*"
 
+    dex_id = pair.get("dexId", "")
+    dex_names = {"raydium": "Raydium", "meteora": "Meteora", "orca": "Orca", "pumpfun": "Pump.fun", "pump": "Pump.fun"}
+    dex_name = dex_names.get(dex_id.lower(), dex_id.capitalize()) if dex_id else ""
+
     lines = [
         header,
-        f"Chain: `{chain}`",
+        f"Chain: `{chain}`" + (f" | DEX: {dex_name}" if dex_name else ""),
         "",
         f"*{name}* (${symbol})",
         "",
@@ -229,10 +233,21 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
     pair_data = token_info.get("pair_data", {})
     mc = pair_data.get("marketCap") or pair_data.get("fdv") or 0
     liq_usd = (pair_data.get("liquidity") or {}).get("usd", sol * 170)
+    dex_id = pair_data.get("dexId", "unknown")
+
+    # Map dexId to friendly name
+    dex_names = {
+        "raydium": "Raydium",
+        "meteora": "Meteora",
+        "orca": "Orca",
+        "pumpfun": "Pump.fun",
+        "pump": "Pump.fun",
+    }
+    dex_name = dex_names.get(dex_id.lower(), dex_id.capitalize()) if dex_id else "Unknown"
 
     lines = [
         f"*NEW POOL*  --  ${symbol}",
-        "Chain: `SOLANA`",
+        f"Chain: `SOLANA` | DEX: {dex_name}",
         "",
         f"Token: `{token_addr}`",
         f"Liquidity: {_fmt_num(liq_usd)}",
