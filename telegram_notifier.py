@@ -162,13 +162,13 @@ def build_message(result: dict, safety: dict | None = None) -> str:
 
 
 async def send_alert(result: dict, safety: dict | None = None) -> bool:
-    """Send a single alert message with optional buy button. Returns True on success."""
+    """Send a single alert message with optional buy buttons. Returns True on success."""
     if not config.TELEGRAM_CHAT_ID:
         logger.error("TELEGRAM_CHAT_ID is not set -- skipping alert")
         return False
     text = build_message(result, safety)
 
-    # Add buy button if trading is enabled
+    # Add buy buttons if trading is enabled (multiple USD amounts)
     reply_markup = None
     if config.TRADING_ENABLED:
         pair = result.get("pair", {})
@@ -177,10 +177,10 @@ async def send_alert(result: dict, safety: dict | None = None) -> bool:
         if token_addr:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             reply_markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"Buy {config.TRADE_AMOUNT_SOL} SOL",
-                    callback_data=f"buy:{token_addr}"
-                ),
+                InlineKeyboardButton("$10", callback_data=f"buyusd:10:{token_addr}"),
+                InlineKeyboardButton("$25", callback_data=f"buyusd:25:{token_addr}"),
+                InlineKeyboardButton("$50", callback_data=f"buyusd:50:{token_addr}"),
+                InlineKeyboardButton("$100", callback_data=f"buyusd:100:{token_addr}"),
             ]])
 
     try:
@@ -238,15 +238,15 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
 
     text = "\n".join(lines)
 
-    # Add buy button if trading is enabled
+    # Add buy buttons if trading is enabled
     reply_markup = None
     if config.TRADING_ENABLED and token_addr:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         reply_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                f"Buy {config.TRADE_AMOUNT_SOL} SOL",
-                callback_data=f"buy:{token_addr}"
-            ),
+            InlineKeyboardButton("$10", callback_data=f"buyusd:10:{token_addr}"),
+            InlineKeyboardButton("$25", callback_data=f"buyusd:25:{token_addr}"),
+            InlineKeyboardButton("$50", callback_data=f"buyusd:50:{token_addr}"),
+            InlineKeyboardButton("$100", callback_data=f"buyusd:100:{token_addr}"),
         ]])
 
     try:
