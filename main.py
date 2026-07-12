@@ -227,12 +227,13 @@ async def _run_chain_cycle(chain_id: str) -> None:
     logger.info("[%s] Cycle done -- %d alerts sent", chain_id, sent)
 
 
-# -- Real-time pool listener (QuickNode websocket) --
+# -- Real-time pool listener --
 
 async def _handle_new_pool(token_info: dict) -> None:
-    """Handle a newly detected pool from the websocket listener.
+    """Handle a newly detected Pump.fun pool.
     
-    Fast-path: minimal checks, alert immediately for brand-new pools.
+    Waits 90 seconds, then checks DexScreener for initial traction
+    (volume, buys) before alerting. Reduces noise from dead pools.
     """
     token_address = token_info["token_address"]
     chain_id = token_info["chain_id"]
@@ -250,37 +251,52 @@ async def _handle_new_pool(token_info: dict) -> None:
     # RugCheck (quick summary call)
     rc_pass, rc_data = rugcheck.evaluate_rugcheck(token_address, chain_id)
     if not rc_pass:
-        logger.info("[WS] %s failed RugCheck -- skipping", token_address[:16])
+        logger.info("[POOL] %s failed RugCheck -- skipping", token_address[:16])
         return
 
-    # Build a minimal alert result
+    # Wait 90 seconds for initial activity, then verify traction
+    logger.info("[POOL] %s passed RugCheck (%.1f SOL) -- waiting 90s for traction...",
+                token_address[:16], sol_deposited)
+    await asyncio.sleep(90)
+
+    # Re-check dedup (DexScreener scanner might have caught it during the wait)
+    if storage.was_recently_alerted(chain_id, token_address):
+        return
+
+    # Check DexScreener for activity
+    pairs = await asyncio.to_thread(dex.fetch_pair_details, chain_id, token_address)
+    if not pairs:
+        logger.debug("[POOL] %s -- no pairs on DexScreener after 90s, skipping", token_address[:16])
+        return
+
+    pair = pairs[0]
+    txns = (pair.get("txns") or {}).get("h1") or {}
+    buys = txns.get("buys", 0) or 0
+    sells = txns.get("sells", 0) or 0
+    total_txns = buys + sells
+
+    # Require minimum activity (at least 5 transactions in the first 90s)
+    if total_txns < 5:
+        logger.debug("[POOL] %s -- only %d txns after 90s, skipping", token_address[:16], total_txns)
+        return
+
+    # Build alert with real data from DexScreener
     latency = time.time() - token_info.get("detected_at", time.time())
-    result = {
-        "score": 0,  # No score yet -- this is a speed play
-        "momentum_realert": False,
-        "prev_score": 0,
-        "pair": {
-            "chainId": "solana",
-            "baseToken": {"address": token_address, "name": "New Pool", "symbol": "???"},
-            "pairAddress": "",
-            "liquidity": {"usd": sol_deposited * 170},  # rough SOL->USD estimate
-            "marketCap": 0,
-            "volume": {"h24": 0},
-            "priceChange": {},
-            "txns": {"h1": {"buys": 0, "sells": 0}},
-            "priceUsd": "0",
-        },
-        "is_new_pool": True,
-        "sol_deposited": sol_deposited,
-        "detection_latency_s": round(latency, 1),
-    }
+    token_info["pair_data"] = pair
+    token_info["total_txns_90s"] = total_txns
+    token_info["buys_90s"] = buys
+
+    # Get token symbol from DexScreener
+    base_token = pair.get("baseToken", {})
+    symbol = base_token.get("symbol", "???")
+    token_info["symbol"] = symbol
 
     # Send alert
     ok = await tg.send_new_pool_alert(token_info, rc_data)
     if ok:
         storage.record_alert(chain_id, token_address, 0)
-        logger.info("[WS] Alert sent for new pool: %s (%.1f SOL, latency=%.1fs)",
-                    token_address[:16], sol_deposited, latency)
+        logger.info("[POOL] Alert sent: %s ($%s) | %.1f SOL | %d txns in 90s",
+                    token_address[:16], symbol, sol_deposited, total_txns)
 
 
 # -- Background tasks (independent of per-chain scheduling) --
@@ -295,6 +311,65 @@ async def _snapshot_loop() -> None:
                 logger.info("[SNAPSHOT] %s", stats)
         except Exception:
             logger.exception("[SNAPSHOT] Error in snapshot tracker")
+
+
+async def _exit_monitor_loop() -> None:
+    """Auto-exit monitor: checks open positions for take-profit or stop-loss."""
+    import executor
+
+    logger.info("[EXIT] Auto-exit monitor started (TP=+%.0f%%, SL=%.0f%%, interval=%ds)",
+                config.TAKE_PROFIT_PCT, config.STOP_LOSS_PCT, config.EXIT_CHECK_INTERVAL)
+
+    while True:
+        await asyncio.sleep(config.EXIT_CHECK_INTERVAL)
+
+        if not config.TRADING_ENABLED:
+            continue
+
+        positions = storage.get_open_positions()
+        if not positions:
+            continue
+
+        for pos in positions:
+            try:
+                pnl = await asyncio.to_thread(executor.check_position_pnl, pos)
+                if pnl is None:
+                    continue
+
+                pnl_pct = pnl["pnl_pct"]
+                token = pos.get("token_address", "?")[:16]
+
+                # Take profit
+                if pnl_pct >= config.TAKE_PROFIT_PCT:
+                    logger.info("[EXIT] TAKE PROFIT: %s at +%.1f%% (%.4f SOL)",
+                                token, pnl_pct, pnl["current_value_sol"])
+                    result = await asyncio.to_thread(
+                        executor.sell_token, pos["id"], pos["token_address"], pos["token_amount"]
+                    )
+                    if result:
+                        await tg.send_trade_notification(
+                            f"SOLD (TP): +{pnl_pct:.0f}% | Received {result['sol_received']:.4f} SOL",
+                            pos["token_address"]
+                        )
+
+                # Stop loss
+                elif pnl_pct <= config.STOP_LOSS_PCT:
+                    logger.info("[EXIT] STOP LOSS: %s at %.1f%% (%.4f SOL)",
+                                token, pnl_pct, pnl["current_value_sol"])
+                    result = await asyncio.to_thread(
+                        executor.sell_token, pos["id"], pos["token_address"], pos["token_amount"]
+                    )
+                    if result:
+                        await tg.send_trade_notification(
+                            f"SOLD (SL): {pnl_pct:.0f}% | Received {result['sol_received']:.4f} SOL",
+                            pos["token_address"]
+                        )
+
+                # Small delay between position checks
+                await asyncio.sleep(2)
+
+            except Exception as e:
+                logger.error("[EXIT] Error checking position #%d: %s", pos.get("id", 0), e)
 
 
 async def _status_log_loop() -> None:
@@ -364,6 +439,7 @@ async def main() -> None:
     asyncio.create_task(_snapshot_loop())
     asyncio.create_task(_status_log_loop())
     asyncio.create_task(_cleanup_loop())
+    asyncio.create_task(_exit_monitor_loop())
 
     # Start real-time pool listener (QuickNode HTTP polling) if configured
     if config.QUICKNODE_HTTP_URL:

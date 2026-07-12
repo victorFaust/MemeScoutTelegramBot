@@ -102,7 +102,7 @@ async def _handle_status_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _handle_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /positions command -- list open positions."""
+    """Handle /positions command -- list open positions with PnL."""
     positions = storage.get_open_positions()
     if not positions:
         if update.message:
@@ -110,13 +110,67 @@ async def _handle_positions_command(update: Update, context: ContextTypes.DEFAUL
         return
 
     lines = ["*Open Positions:*", ""]
-    for p in positions:
+    for i, p in enumerate(positions):
         token = p.get("token_address", "?")[:12]
         amount = p.get("buy_amount_sol", 0)
-        lines.append(f"- `{token}...` | {amount} SOL")
+        pos_id = p.get("id", 0)
+        lines.append(f"{i+1}. `{token}...` | {amount} SOL | ID: {pos_id}")
+
+    lines.append("")
+    lines.append("Use /sell <ID> to close a position")
 
     if update.message:
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def _handle_sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /sell <position_id> command -- manually close a position."""
+    if not update.message:
+        return
+
+    args = context.args
+    if not args:
+        # Sell all positions
+        positions = storage.get_open_positions()
+        if not positions:
+            await update.message.reply_text("No open positions to sell.")
+            return
+        await update.message.reply_text(f"Selling {len(positions)} position(s)...")
+        for pos in positions:
+            result = await asyncio.to_thread(
+                executor.sell_token, pos["id"], pos["token_address"], pos["token_amount"]
+            )
+            if result:
+                await update.message.reply_text(
+                    f"Sold #{pos['id']} for {result['sol_received']:.4f} SOL"
+                )
+            else:
+                await update.message.reply_text(f"Failed to sell #{pos['id']}")
+        return
+
+    # Sell specific position by ID
+    try:
+        pos_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /sell <position_id> or /sell (sells all)")
+        return
+
+    positions = storage.get_open_positions()
+    pos = next((p for p in positions if p.get("id") == pos_id), None)
+    if not pos:
+        await update.message.reply_text(f"Position #{pos_id} not found or already closed.")
+        return
+
+    await update.message.reply_text(f"Selling position #{pos_id}...")
+    result = await asyncio.to_thread(
+        executor.sell_token, pos["id"], pos["token_address"], pos["token_amount"]
+    )
+    if result:
+        await update.message.reply_text(
+            f"Sold #{pos_id} for {result['sol_received']:.4f} SOL (tx: {result['signature'][:16]}...)"
+        )
+    else:
+        await update.message.reply_text(f"Failed to sell #{pos_id} -- check logs")
 
 
 async def start_bot_handler() -> None:
@@ -135,9 +189,10 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("stop", _handle_stop_command))
     app.add_handler(CommandHandler("status", _handle_status_command))
     app.add_handler(CommandHandler("positions", _handle_positions_command))
+    app.add_handler(CommandHandler("sell", _handle_sell_command))
 
     # Start polling for updates (non-blocking)
-    logger.info("[BOT] Starting Telegram callback handler (commands: /stop, /status, /positions)")
+    logger.info("[BOT] Starting Telegram callback handler (commands: /stop, /status, /positions, /sell)")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
