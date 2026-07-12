@@ -274,3 +274,68 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
     logger.info("[TRADE] Bought %s for %.3f SOL (impact=%.1f%%, sig=%s)",
                 token_mint[:16], amount_sol, price_impact, result["signature"][:16])
     return result
+
+
+def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | None:
+    """Execute a sell (token -> SOL) for an open position.
+    
+    Returns trade result dict or None on failure.
+    """
+    if not config.TRADING_ENABLED:
+        logger.warning("[TRADE] Sell blocked: trading disabled")
+        return None
+
+    if token_amount <= 0:
+        logger.warning("[TRADE] Sell blocked: no token amount")
+        return None
+
+    # Get sell quote
+    quote = get_sell_quote(token_mint, token_amount)
+    if quote is None:
+        return None
+
+    # Execute
+    result = execute_swap(quote)
+    if result is None:
+        return None
+
+    # Calculate SOL received
+    sol_received = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL
+
+    # Close the position in DB
+    storage.close_position(position_id, sol_received, result["signature"])
+
+    result["sol_received"] = sol_received
+    result["position_id"] = position_id
+    result["token_mint"] = token_mint
+
+    logger.info("[TRADE] Sold position #%d (%s) for %.4f SOL (sig=%s)",
+                position_id, token_mint[:16], sol_received, result["signature"][:16])
+    return result
+
+
+def check_position_pnl(position: dict) -> dict | None:
+    """Check current PnL for an open position by getting a sell quote.
+    
+    Returns {"current_value_sol": float, "pnl_pct": float, "pnl_sol": float} or None.
+    """
+    token_mint = position.get("token_address", "")
+    token_amount = position.get("token_amount", 0)
+    buy_amount = position.get("buy_amount_sol", 0)
+
+    if not token_mint or token_amount <= 0 or buy_amount <= 0:
+        return None
+
+    quote = get_sell_quote(token_mint, token_amount)
+    if quote is None:
+        return None
+
+    current_value_sol = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL
+    pnl_sol = current_value_sol - buy_amount
+    pnl_pct = (pnl_sol / buy_amount) * 100 if buy_amount > 0 else 0
+
+    return {
+        "current_value_sol": current_value_sol,
+        "pnl_sol": round(pnl_sol, 6),
+        "pnl_pct": round(pnl_pct, 1),
+    }

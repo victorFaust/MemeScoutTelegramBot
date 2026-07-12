@@ -205,19 +205,27 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
 
     token_addr = token_info.get("token_address", "???")
     sol = token_info.get("sol_deposited", 0)
-    latency = token_info.get("detected_at", 0)
-    latency_s = f"{(time.time() - latency):.1f}s" if latency else "?"
+    symbol = token_info.get("symbol", "???")
+    total_txns = token_info.get("total_txns_90s", 0)
+    buys = token_info.get("buys_90s", 0)
 
     dex_url = f"https://dexscreener.com/solana/{token_addr}"
 
+    # Get extra data from DexScreener pair if available
+    pair_data = token_info.get("pair_data", {})
+    mc = pair_data.get("marketCap") or pair_data.get("fdv") or 0
+    liq_usd = (pair_data.get("liquidity") or {}).get("usd", sol * 170)
+
     lines = [
-        "*NEW POOL DETECTED*  --  Speed Alert",
+        f"*NEW POOL*  --  ${symbol}",
         "Chain: `SOLANA`",
         "",
         f"Token: `{token_addr}`",
-        f"Initial liquidity: ~{sol:.1f} SOL (${sol * 170:.0f})",
-        f"Detection latency: {latency_s}",
+        f"Liquidity: {_fmt_num(liq_usd)}",
     ]
+    if mc:
+        lines.append(f"Market Cap: {_fmt_num(mc)}")
+    lines.append(f"Activity (90s): {total_txns} txns ({buys} buys)")
 
     if rc_data:
         rc_score = rc_data.get("rugcheck_score")
@@ -227,8 +235,6 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
 
     lines.append("")
     lines.append(f"[View on DexScreener]({dex_url})")
-    lines.append("")
-    lines.append("_Early detection -- DYOR, no score yet_")
 
     text = "\n".join(lines)
 
@@ -254,4 +260,27 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
         return True
     except Exception:
         logger.exception("Failed to send new pool alert")
+        return False
+
+
+async def send_trade_notification(message: str, token_address: str = "") -> bool:
+    """Send a trade execution notification (buy/sell confirmations)."""
+    if not config.TELEGRAM_CHAT_ID:
+        return False
+
+    dex_url = f"https://dexscreener.com/solana/{token_address}" if token_address else ""
+    text = f"*TRADE*: {message}"
+    if dex_url:
+        text += f"\n[Chart]({dex_url})"
+
+    try:
+        bot = _get_bot()
+        await bot.send_message(
+            chat_id=config.TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode=telegram.constants.ParseMode.MARKDOWN,
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to send trade notification")
         return False
