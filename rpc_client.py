@@ -109,12 +109,21 @@ def rpc_call(method: str, params: list, tier: str | None = None) -> Any:
     if not _initialized:
         _init_providers()
 
+    # Index methods (token queries) don't work on Shyft free tier
+    _INDEX_METHODS = {"getTokenLargestAccounts", "getTokenSupply", "getTokenAccountsByOwner",
+                      "getTokenAccountBalance", "getProgramAccounts"}
+    skip_shyft = method in _INDEX_METHODS
+
     # Try up to 3 providers
     for attempt in range(min(3, len(_providers))):
         provider = _get_provider(tier)
         if provider is None:
             logger.error("[RPC] No available providers")
             return None
+
+        # Skip Shyft for index methods
+        if skip_shyft and provider["name"] == "Shyft":
+            continue
 
         try:
             resp = requests.post(provider["url"], json={
@@ -126,6 +135,10 @@ def rpc_call(method: str, params: list, tier: str | None = None) -> Any:
 
             if resp.status_code == 429:
                 _mark_rate_limited(provider["name"])
+                continue
+
+            if resp.status_code == 403:
+                logger.debug("[RPC] %s returned 403 for %s -- skipping", provider["name"], method)
                 continue
 
             resp.raise_for_status()
