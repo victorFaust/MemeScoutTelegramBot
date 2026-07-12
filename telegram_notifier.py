@@ -239,6 +239,20 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
     ]
     if mc:
         lines.append(f"Market Cap: {_fmt_num(mc)}")
+
+    # Token age
+    pair_created = pair_data.get("pairCreatedAt")
+    if pair_created:
+        import time as _time
+        age_hours = (_time.time() * 1000 - pair_created) / 3_600_000
+        if age_hours < 1:
+            age_str = f"{age_hours * 60:.0f}m"
+        elif age_hours < 24:
+            age_str = f"{age_hours:.0f}h"
+        else:
+            age_str = f"{age_hours / 24:.1f}d"
+        lines.append(f"Age: {age_str}")
+
     lines.append(f"Activity (90s): {total_txns} txns ({buys} buys)")
 
     if rc_data:
