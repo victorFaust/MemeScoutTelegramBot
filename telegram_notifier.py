@@ -177,10 +177,10 @@ async def send_alert(result: dict, safety: dict | None = None) -> bool:
         if token_addr:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             reply_markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton("$10", callback_data=f"buyusd:10:{token_addr}"),
-                InlineKeyboardButton("$25", callback_data=f"buyusd:25:{token_addr}"),
-                InlineKeyboardButton("$50", callback_data=f"buyusd:50:{token_addr}"),
-                InlineKeyboardButton("$100", callback_data=f"buyusd:100:{token_addr}"),
+                InlineKeyboardButton("$1", callback_data=f"buyusd:1:{token_addr}"),
+                InlineKeyboardButton("$3", callback_data=f"buyusd:3:{token_addr}"),
+                InlineKeyboardButton("$5", callback_data=f"buyusd:5:{token_addr}"),
+                InlineKeyboardButton("$8", callback_data=f"buyusd:8:{token_addr}"),
             ]])
 
     try:
@@ -243,10 +243,10 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
     if config.TRADING_ENABLED and token_addr:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         reply_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("$10", callback_data=f"buyusd:10:{token_addr}"),
-            InlineKeyboardButton("$25", callback_data=f"buyusd:25:{token_addr}"),
-            InlineKeyboardButton("$50", callback_data=f"buyusd:50:{token_addr}"),
-            InlineKeyboardButton("$100", callback_data=f"buyusd:100:{token_addr}"),
+            InlineKeyboardButton("$1", callback_data=f"buyusd:1:{token_addr}"),
+            InlineKeyboardButton("$3", callback_data=f"buyusd:3:{token_addr}"),
+            InlineKeyboardButton("$5", callback_data=f"buyusd:5:{token_addr}"),
+            InlineKeyboardButton("$8", callback_data=f"buyusd:8:{token_addr}"),
         ]])
 
     try:
