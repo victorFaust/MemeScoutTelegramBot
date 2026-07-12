@@ -247,11 +247,18 @@ async def _handle_positions_command(update: Update, context: ContextTypes.DEFAUL
                 base = pairs[0].get("baseToken", {})
                 symbol = base.get("symbol", token_addr[:8])
 
-            # Estimate entry MC from price ratio
+            # Estimate entry MC and prices from ratio
             if current_val > 0 and amount_sol > 0:
                 entry_mc = current_mc * (amount_sol / current_val) if current_mc else 0
             else:
                 entry_mc = 0
+
+            # Calculate entry price and current price per token
+            entry_price = amount_sol / token_amount if token_amount > 0 else 0
+            current_price = current_val / token_amount if token_amount > 0 else 0
+            sol_price = executor.get_sol_price()
+            entry_price_usd = entry_price * sol_price
+            current_price_usd = current_price * sol_price
 
             sign = "+" if pnl_pct >= 0 else ""
             mc_str = f"${current_mc/1000:.0f}K" if current_mc >= 1000 else f"${current_mc:.0f}"
@@ -260,6 +267,7 @@ async def _handle_positions_command(update: Update, context: ContextTypes.DEFAUL
             lines.append(
                 f"{i+1}. ${symbol} (#{pos_id})\n"
                 f"   Entry: {entry_mc_str} MC | Now: {mc_str} MC\n"
+                f"   Buy price: ${entry_price_usd:.8f} | Now: ${current_price_usd:.8f}\n"
                 f"   PnL: {sign}{pnl_pct:.0f}% ({sign}{pnl_sol:.4f} SOL)\n"
                 f"   Value: {current_val:.4f} SOL"
             )
