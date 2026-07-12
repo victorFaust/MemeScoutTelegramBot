@@ -107,8 +107,8 @@ async def _handle_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Invalid amount. Use: /buy <token> $25")
         return
 
-    if usd_amount <= 0 or usd_amount > 500:
-        await update.message.reply_text("Amount must be between $1 and $500")
+    if usd_amount <= 0 or usd_amount > 100:
+        await update.message.reply_text("Amount must be between $0.50 and $100")
         return
 
     amount_sol = executor.usd_to_sol(usd_amount)
