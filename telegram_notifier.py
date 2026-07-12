@@ -99,6 +99,20 @@ def build_message(result: dict, safety: dict | None = None) -> str:
         lines.append(f"Market Cap: {_fmt_num(mc)}")
 
     lines.append(f"Volume 24h: {_fmt_num(vol_24h)}")
+
+    # Token age
+    pair_created = pair.get("pairCreatedAt")
+    if pair_created:
+        import time as _time
+        age_hours = (_time.time() * 1000 - pair_created) / 3_600_000
+        if age_hours < 1:
+            age_str = f"{age_hours * 60:.0f}m"
+        elif age_hours < 24:
+            age_str = f"{age_hours:.0f}h"
+        else:
+            age_str = f"{age_hours / 24:.1f}d"
+        lines.append(f"Age: {age_str}")
+
     lines.append("")
     lines.append(f"1h: {_fmt_pct(pc.get('h1'))}  |  6h: {_fmt_pct(pc.get('h6'))}  |  24h: {_fmt_pct(pc.get('h24'))}")
     lines.append(f"Buys/Sells (1h): {buy_ratio}")
