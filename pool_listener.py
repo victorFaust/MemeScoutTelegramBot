@@ -145,8 +145,7 @@ class PoolListener:
     async def start(self) -> None:
         """Start polling loop."""
         self._running = True
-        logger.info("[POOL] Starting Pump.fun pool poller (interval=%ds, rpc=%s)",
-                    _POLL_INTERVAL, _get_pool_rpc_url()[:40])
+        logger.info("[POOL] Starting Pump.fun pool poller (interval=%ds)", _POLL_INTERVAL)
 
         # Initialize: get the latest signature so we only process NEW ones
         sigs = _get_recent_signatures(PUMP_FUN_PROGRAM, limit=1)
