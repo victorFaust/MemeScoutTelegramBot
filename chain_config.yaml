@@ -68,36 +68,3 @@ solana:
     reject_honeypot: true
     reject_mint_authority: true
     reject_blacklist: true
-
-robinhood:
-  poll_interval_seconds: 75
-  min_market_cap: 5000
-  max_market_cap: 10000
-  min_liquidity_usd: 2000
-  max_liquidity_usd: 50000
-  max_pair_age_hours: 72
-  min_volume_liquidity_ratio: 0.5
-  min_price_change_1h: 0.0
-  min_price_change_6h: 0.0
-  min_buy_sell_ratio: 1.2
-  min_txns_1h: 10
-  min_alert_score: 45
-  momentum_realert_threshold: 15
-  safety_skip_on_failure: true
-
-  weights:
-    liquidity: 12
-    market_cap: 18
-    pair_age: 8
-    vol_liq_ratio: 18
-    price_change: 14
-    buy_sell_ratio: 18
-    velocity: 12
-
-  safety:
-    max_buy_tax_pct: 10
-    max_sell_tax_pct: 10
-    max_top10_holder_pct: 70
-    reject_honeypot: true
-    reject_mint_authority: false
-    reject_blacklist: true
