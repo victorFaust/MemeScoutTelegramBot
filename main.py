@@ -231,84 +231,68 @@ async def _run_chain_cycle(chain_id: str) -> None:
 # -- Real-time pool listener --
 
 async def _handle_new_pool(token_info: dict) -> None:
-    """Handle a newly detected Pump.fun pool.
+    """Handle a newly discovered token from RugCheck new_tokens feed.
     
-    Waits 90 seconds, then checks DexScreener for initial traction
-    (volume, buys) before alerting. Reduces noise from dead pools.
+    RugCheck data (score, LP lock, risks) is already included in token_info.
+    Waits 60 seconds, then checks DexScreener for traction before alerting.
     """
     token_address = token_info["token_address"]
     chain_id = token_info["chain_id"]
-    sol_deposited = token_info.get("sol_deposited", 0)
+    symbol = token_info.get("symbol", "???")
 
-    # Dedup: don't alert if we've seen this token before
+    # Dedup
     if storage.was_recently_alerted(chain_id, token_address):
         return
 
-    # Also skip if already tracked in metrics (DexScreener scanner saw it)
-    prev = storage.get_previous_metrics(token_address, chain_id)
-    if prev is not None:
-        return
+    # RugCheck data already included from pool_listener
+    rc_data = {
+        "rugcheck_score": token_info.get("rugcheck_score"),
+        "lp_locked_pct": token_info.get("lp_locked_pct", 0),
+        "risks": token_info.get("risks", []),
+        "risk_count": token_info.get("risk_count", 0),
+    }
 
-    # RugCheck (quick summary call)
-    rc_pass, rc_data = rugcheck.evaluate_rugcheck(token_address, chain_id)
-    if not rc_pass:
-        logger.info("[POOL] %s failed RugCheck -- skipping", token_address[:16])
-        return
+    # Wait 60 seconds for initial activity
+    logger.info("[POOL] $%s (%s) -- waiting 60s for traction...", symbol, token_address[:16])
+    await asyncio.sleep(60)
 
-    # Wait 90 seconds for initial activity, then verify traction
-    logger.info("[POOL] %s passed RugCheck (%.1f SOL) -- waiting 90s for traction...",
-                token_address[:16], sol_deposited)
-    await asyncio.sleep(90)
-
-    # Re-check dedup (DexScreener scanner might have caught it during the wait)
+    # Re-check dedup
     if storage.was_recently_alerted(chain_id, token_address):
         return
 
     # Check DexScreener for activity
     pairs = await asyncio.to_thread(dex.fetch_pair_details, chain_id, token_address)
     if not pairs:
-        logger.debug("[POOL] %s -- no pairs on DexScreener after 90s, skipping", token_address[:16])
+        logger.debug("[POOL] $%s -- not on DexScreener yet, skipping", symbol)
         return
 
     pair = pairs[0]
     txns = (pair.get("txns") or {}).get("h1") or {}
     buys = txns.get("buys", 0) or 0
-    sells = txns.get("sells", 0) or 0
-    total_txns = buys + sells
+    total_txns = buys + (txns.get("sells", 0) or 0)
 
-    # Require minimum activity (at least 5 transactions in the first 90s)
-    if total_txns < 5:
-        logger.debug("[POOL] %s -- only %d txns after 90s, skipping", token_address[:16], total_txns)
+    if total_txns < 3:
+        logger.debug("[POOL] $%s -- only %d txns after 60s, skipping", symbol, total_txns)
         return
 
-    # Holder analysis (unique buyers check -- uses QuickNode/Shyft)
-    cfg = config.get_chain_profile(chain_id)
-    holder_pass, holder_data = await asyncio.to_thread(
-        holder_analysis.passes_holder_checks, token_address, cfg
-    )
-    if not holder_pass:
-        logger.info("[POOL] %s failed holder analysis -- skipping", token_address[:16])
-        return
-
-    # Build alert with real data from DexScreener
-    latency = time.time() - token_info.get("detected_at", time.time())
+    # Build alert data
     token_info["pair_data"] = pair
     token_info["total_txns_90s"] = total_txns
     token_info["buys_90s"] = buys
 
-    # Get token symbol from DexScreener
+    # Update symbol from DexScreener if available
     base_token = pair.get("baseToken", {})
-    symbol = base_token.get("symbol", "???")
-    token_info["symbol"] = symbol
+    if base_token.get("symbol"):
+        token_info["symbol"] = base_token["symbol"]
 
     # Send alert
-    ok = await tg.send_new_pool_alert(token_info, rc_data if not holder_data else {**(rc_data or {}), **holder_data})
+    ok = await tg.send_new_pool_alert(token_info, rc_data)
     if ok:
         storage.record_alert(chain_id, token_address, 0)
-        logger.info("[POOL] Alert sent: %s ($%s) | %.1f SOL | %d txns in 90s",
-                    token_address[:16], symbol, sol_deposited, total_txns)
+        logger.info("[POOL] Alert sent: $%s (%s) | %d txns",
+                    token_info["symbol"], token_address[:16], total_txns)
 
-        # Auto-buy new pools if enabled
+        # Auto-buy if enabled
         if config.AUTO_BUY_NEW_POOLS and config.AUTO_BUY_ENABLED and config.TRADING_ENABLED:
             import executor
             amount_sol = executor.usd_to_sol(config.AUTO_BUY_AMOUNT_USD)
@@ -317,12 +301,10 @@ async def _handle_new_pool(token_info: dict) -> None:
                 buy_result = await asyncio.to_thread(executor.buy_token, token_address, amount_sol)
                 if buy_result:
                     await tg.send_trade_notification(
-                        f"AUTO-BUY (new pool): ${config.AUTO_BUY_AMOUNT_USD:.0f} ({amount_sol:.3f} SOL) | "
-                        f"${symbol} | impact: {buy_result.get('price_impact_pct', 0):.1f}%",
+                        f"AUTO-BUY: ${config.AUTO_BUY_AMOUNT_USD:.0f} ({amount_sol:.3f} SOL) | "
+                        f"${token_info['symbol']}",
                         token_address
                     )
-                    logger.info("[AUTO] Bought new pool %s ($%s) for $%.0f",
-                                token_address[:16], symbol, config.AUTO_BUY_AMOUNT_USD)
 
 
 # -- Background tasks (independent of per-chain scheduling) --
@@ -467,13 +449,9 @@ async def main() -> None:
     asyncio.create_task(_cleanup_loop())
     asyncio.create_task(_exit_monitor_loop())
 
-    # Start real-time pool listener (QuickNode HTTP polling) if configured
-    if config.QUICKNODE_HTTP_URL:
-        listener = pool_listener.PoolListener(on_new_pool=_handle_new_pool)
-        asyncio.create_task(listener.start())
-        logger.info("[POOL] Pump.fun pool poller started")
-    else:
-        logger.warning("[POOL] QUICKNODE_HTTP_URL not set -- pool detection disabled")
+    # Start new token discovery (RugCheck feed)
+    listener = pool_listener.PoolListener(on_new_pool=_handle_new_pool)
+    asyncio.create_task(listener.start())
 
     # Start Telegram bot handler (for buy buttons + commands)
     asyncio.create_task(bot_handler.start_bot_handler())

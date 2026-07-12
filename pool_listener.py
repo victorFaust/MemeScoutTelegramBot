@@ -1,268 +1,155 @@
-﻿"""Solana new pool listener via HTTP RPC polling.
+﻿"""New Solana token discovery via RugCheck new_tokens API.
 
-Uses shared RPC client (QuickNode + Shyft + public) for load balanced polling.
-Polls every 30s to detect new Pump.fun pool creation transactions.
+Polls RugCheck every 10 seconds for brand-new Pump.fun tokens.
+Gets instant RugCheck score + LP lock status with each token.
+This catches tokens BEFORE they appear on DexScreener.
 """
 
 import asyncio
 import logging
 import time
-from typing import Any, Callable
+from typing import Callable
 
-import rpc_client
+import requests
+
 import config
 import storage
 
 logger = logging.getLogger(__name__)
 
-# Program IDs to monitor for new pools
-PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+RUGCHECK_NEW_TOKENS_URL = "https://api.rugcheck.xyz/v1/stats/new_tokens"
+RUGCHECK_SUMMARY_URL = "https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
 
-# Polling interval (seconds)
-# Polling interval -- use premium RPCs for speed
-_POLL_INTERVAL = 8   # 8 seconds (QuickNode/Shyft can handle this)
-_BACKOFF_INTERVAL = 30
-
-# Minimum initial liquidity to consider (in SOL)
-_MIN_INITIAL_LIQUIDITY_SOL = 1.5
+_POLL_INTERVAL = 10  # seconds
 
 
-def _get_recent_signatures(program_id: str, limit: int = 20, before: str | None = None) -> list[dict]:
-    """Get recent transaction signatures. Uses premium RPC for speed."""
-    params: list = [program_id, {"limit": limit, "commitment": "confirmed"}]
-    if before:
-        params[1]["before"] = before
-    # Use premium RPCs (QuickNode/Shyft) -- they're faster and more reliable
-    result = rpc_client.rpc_call("getSignaturesForAddress", params, tier="premium")
-    if result is None:
-        # Fallback to public if premium is rate-limited
-        result = rpc_client.rpc_call("getSignaturesForAddress", params, tier="public")
-    return result if result else []
+def _fetch_new_tokens() -> list[dict]:
+    """Fetch latest new tokens from RugCheck."""
+    try:
+        resp = requests.get(RUGCHECK_NEW_TOKENS_URL, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+    except requests.RequestException as e:
+        logger.warning("[POOL] Failed to fetch new tokens: %s", e)
+        return []
 
 
-def _fetch_transaction(signature: str) -> dict | None:
-    """Fetch a parsed transaction. Uses premium RPC."""
-    result = rpc_client.rpc_call("getTransaction", [
-        signature,
-        {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-    ], tier="premium")
-    return result
-
-
-def _is_pool_creation(tx_data: dict) -> bool:
-    """Check if a transaction is a pool/token creation (not just a swap).
-    
-    Pump.fun token creation logs include various patterns depending on version.
-    """
-    if not tx_data:
-        return False
-    meta = tx_data.get("meta", {})
-    if meta.get("err"):
-        return False
-
-    logs = meta.get("logMessages", [])
-    creation_keywords = [
-        "Program log: Instruction: Create",
-        "Program log: Instruction: Initialize",
-        "InitializeMint",
-        "Program log: create",
-        "invoke [1]",  # Pump.fun direct invocation (creation)
-    ]
-
-    # Pump.fun creates have initializeMint in inner instructions
-    inner = meta.get("innerInstructions", [])
-    for group in inner:
-        for ix in group.get("instructions", []):
-            parsed = ix.get("parsed", {})
-            if isinstance(parsed, dict) and parsed.get("type") in ("initializeMint", "initializeMint2"):
-                return True
-
-    # Also check log messages
-    for log_line in logs:
-        if any(kw in log_line for kw in creation_keywords):
-            return True
-
-    return False
-
-
-def _extract_token_from_tx(tx_data: dict) -> dict | None:
-    """Extract the new token mint address and initial liquidity from a parsed transaction."""
-    meta = tx_data.get("meta", {})
-    message = tx_data.get("transaction", {}).get("message", {})
-    inner_instructions = meta.get("innerInstructions", [])
-    instructions = message.get("instructions", [])
-    account_keys = message.get("accountKeys", [])
-
-    token_mint = None
-
-    # Look for initializeMint in inner instructions
-    for ix_group in inner_instructions:
-        for ix in ix_group.get("instructions", []):
-            parsed = ix.get("parsed", {})
-            if isinstance(parsed, dict):
-                ix_type = parsed.get("type", "")
-                if ix_type in ("initializeMint", "initializeMint2"):
-                    token_mint = parsed.get("info", {}).get("mint")
-                    break
-        if token_mint:
-            break
-
-    # Also check top-level instructions
-    if not token_mint:
-        for ix in instructions:
-            parsed = ix.get("parsed", {})
-            if isinstance(parsed, dict):
-                if parsed.get("type") in ("initializeMint", "initializeMint2"):
-                    token_mint = parsed.get("info", {}).get("mint")
-                    break
-
-    # Fallback: find non-system addresses in account keys
-    if not token_mint:
-        system_programs = {
-            "11111111111111111111111111111111",
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-            PUMP_FUN_PROGRAM,
-            "SysvarRent111111111111111111111111111111111",
-            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-            "ComputeBudget111111111111111111111111111111",
-        }
-        for key in account_keys:
-            addr = key.get("pubkey", key) if isinstance(key, dict) else str(key)
-            if addr not in system_programs and len(addr) > 30 and addr.endswith("pump"):
-                token_mint = addr
-                break
-
-    if not token_mint:
+def _get_rugcheck_summary(mint: str) -> dict | None:
+    """Get RugCheck safety summary for a token."""
+    try:
+        resp = requests.get(
+            RUGCHECK_SUMMARY_URL.format(mint=mint),
+            timeout=10,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as e:
+        logger.debug("[POOL] RugCheck summary failed for %s: %s", mint[:16], e)
         return None
-
-    # Estimate SOL deposited from balance changes
-    pre_balances = meta.get("preBalances", [])
-    post_balances = meta.get("postBalances", [])
-    sol_deposited = 0.0
-    if pre_balances and post_balances:
-        for pre, post in zip(pre_balances, post_balances):
-            diff = (post - pre) / 1e9
-            if diff > sol_deposited:
-                sol_deposited = diff
-
-    return {
-        "token_address": token_mint,
-        "sol_deposited": sol_deposited,
-        "chain_id": "solana",
-    }
 
 
 class PoolListener:
-    """HTTP polling-based listener for new Solana pool creation events."""
+    """Polls RugCheck for newly created Solana tokens."""
 
     def __init__(self, on_new_pool: Callable):
         self._on_new_pool = on_new_pool
         self._running = False
-        self._last_signature: str | None = None
-        self._seen_signatures: set = set()
-        self._current_interval = _POLL_INTERVAL
-        self._consecutive_errors = 0
+        self._seen_mints: set = set()
 
     async def start(self) -> None:
         """Start polling loop."""
         self._running = True
-        logger.info("[POOL] Starting Pump.fun pool poller (interval=%ds)", _POLL_INTERVAL)
-
-        # Initialize: get the latest signature so we only process NEW ones
-        sigs = _get_recent_signatures(PUMP_FUN_PROGRAM, limit=1)
-        if sigs:
-            self._last_signature = sigs[0].get("signature")
-            logger.info("[POOL] Initialized -- latest sig: %s",
-                        self._last_signature[:16] if self._last_signature else "none")
-        else:
-            logger.warning("[POOL] Could not initialize -- will retry on next cycle")
+        logger.info("[POOL] Starting new token discovery (RugCheck, interval=%ds)", _POLL_INTERVAL)
 
         while self._running:
             try:
                 await self._poll_cycle()
             except Exception as e:
                 logger.error("[POOL] Error in poll cycle: %s", e)
-                self._consecutive_errors += 1
 
-            # Back off on repeated errors
-            if self._consecutive_errors >= 3:
-                self._current_interval = _BACKOFF_INTERVAL
-            else:
-                self._current_interval = _POLL_INTERVAL
-
-            await asyncio.sleep(self._current_interval)
+            await asyncio.sleep(_POLL_INTERVAL)
 
     def stop(self) -> None:
         self._running = False
 
     async def _poll_cycle(self) -> None:
-        """Check for new Pump.fun transactions since last poll."""
-        sigs = await asyncio.to_thread(
-            _get_recent_signatures, PUMP_FUN_PROGRAM, 20
-        )
-
-        if not sigs:
-            self._consecutive_errors += 1
+        """Fetch new tokens and process unseen ones."""
+        tokens = await asyncio.to_thread(_fetch_new_tokens)
+        if not tokens:
             return
 
-        # Success -- reset error counter
-        self._consecutive_errors = 0
+        new_count = 0
+        for token in tokens:
+            mint = token.get("mint", "")
+            if not mint or mint in self._seen_mints:
+                continue
 
-        # Process new signatures (newest first, stop at last seen)
-        new_sigs = []
-        for sig_info in sigs:
-            sig = sig_info.get("signature", "")
-            if sig == self._last_signature or sig in self._seen_signatures:
-                break
-            new_sigs.append(sig)
+            self._seen_mints.add(mint)
+            new_count += 1
 
-        if not new_sigs:
-            return
+            # Skip if already alerted
+            if storage.was_recently_alerted("solana", mint):
+                continue
 
-        # Update last seen
-        self._last_signature = sigs[0].get("signature")
+            symbol = token.get("symbol", "???")
+            creator = token.get("creator", "")
+            mint_authority = token.get("mintAuthority", "")
+            freeze_authority = token.get("freezeAuthority", "")
 
-        logger.info("[POOL] Found %d new Pump.fun transactions", len(new_sigs))
+            # Quick safety checks from token metadata
+            if mint_authority:
+                logger.debug("[POOL] %s ($%s) -- mint authority active, skipping", mint[:16], symbol)
+                continue
+            if freeze_authority:
+                logger.debug("[POOL] %s ($%s) -- freeze authority active, skipping", mint[:16], symbol)
+                continue
 
-        # Process new signatures (up to 5 per cycle with premium RPCs)
-        for sig in new_sigs[:5]:
-            self._seen_signatures.add(sig)
-            await self._process_signature(sig)
-            await asyncio.sleep(0.5)
+            # Get RugCheck score
+            summary = await asyncio.to_thread(_get_rugcheck_summary, mint)
+            if summary is None:
+                continue
+
+            score = summary.get("score_normalised", 0)
+            if isinstance(score, (int, float)) and score > 1:
+                score = score / 1000  # normalize if raw score
+            lp_locked = summary.get("lpLockedPct", 0)
+            risks = summary.get("risks", [])
+
+            # Filter: minimum RugCheck score
+            cfg = config.get_chain_profile("solana")
+            min_score = cfg.get("min_rugcheck_score", 0.5)
+            if score < min_score:
+                logger.debug("[POOL] %s ($%s) -- RugCheck score %.2f < %.2f, skipping",
+                             mint[:16], symbol, score, min_score)
+                continue
+
+            token_info = {
+                "token_address": mint,
+                "chain_id": "solana",
+                "symbol": symbol,
+                "sol_deposited": 0,
+                "detected_at": time.time(),
+                "rugcheck_score": score,
+                "lp_locked_pct": lp_locked,
+                "risk_count": len(risks),
+                "risks": [r.get("name", str(r)) if isinstance(r, dict) else str(r) for r in risks],
+                "creator": creator,
+            }
+
+            logger.info("[POOL] New token: $%s (%s) | RugCheck: %.0f%% | LP: %.0f%% | risks: %d",
+                        symbol, mint[:16], score * 100 if score <= 1 else score, lp_locked, len(risks))
+
+            try:
+                await self._on_new_pool(token_info)
+            except Exception as e:
+                logger.error("[POOL] Error in handler for %s: %s", mint[:16], e)
+
+        if new_count > 0:
+            logger.info("[POOL] Processed %d new tokens", new_count)
 
         # Trim seen set
-        if len(self._seen_signatures) > 5000:
-            self._seen_signatures = set(list(self._seen_signatures)[-2500:])
-
-    async def _process_signature(self, signature: str) -> None:
-        """Fetch and process a single transaction."""
-        tx_data = await asyncio.to_thread(_fetch_transaction, signature)
-        if tx_data is None:
-            logger.debug("[POOL] Failed to fetch tx: %s", signature[:16])
-            return
-
-        if not _is_pool_creation(tx_data):
-            return
-
-        token_info = _extract_token_from_tx(tx_data)
-        if token_info is None:
-            logger.debug("[POOL] Could not extract token from creation tx: %s", signature[:16])
-            return
-
-        # Filter: minimum SOL deposited (lowered to 1.5 SOL to catch more)
-        if token_info["sol_deposited"] < _MIN_INITIAL_LIQUIDITY_SOL:
-            logger.info("[POOL] Skipping %s -- low liquidity (%.2f SOL)",
-                        token_info["token_address"][:16], token_info["sol_deposited"])
-            return
-
-        token_info["signature"] = signature
-        token_info["detected_at"] = time.time()
-
-        logger.info("[POOL] New pool: token=%s, liquidity=%.1f SOL",
-                    token_info["token_address"][:16], token_info["sol_deposited"])
-
-        try:
-            await self._on_new_pool(token_info)
-        except Exception as e:
-            logger.error("[POOL] Error in new pool handler: %s", e)
+        if len(self._seen_mints) > 5000:
+            self._seen_mints = set(list(self._seen_mints)[-2500:])
