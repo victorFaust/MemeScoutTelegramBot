@@ -42,6 +42,14 @@ SKIP_ON_SAFETY_CHECK_FAILURE: bool = os.getenv("SKIP_ON_SAFETY_CHECK_FAILURE", "
 QUICKNODE_WSS_URL: str = os.getenv("QUICKNODE_WSS_URL", "")
 QUICKNODE_HTTP_URL: str = os.getenv("QUICKNODE_HTTP_URL", "")
 
+# Trading (Jupiter swap)
+TRADING_WALLET_PRIVATE_KEY: str = os.getenv("TRADING_WALLET_PRIVATE_KEY", "")
+TRADE_AMOUNT_SOL: float = _float("TRADE_AMOUNT_SOL", 0.1)
+MAX_OPEN_POSITIONS: int = _int("MAX_OPEN_POSITIONS", 5)
+DAILY_LOSS_LIMIT_SOL: float = _float("DAILY_LOSS_LIMIT_SOL", 1.0)
+TRADE_SLIPPAGE_BPS: int = _int("TRADE_SLIPPAGE_BPS", 500)  # 5% default slippage
+TRADING_ENABLED: bool = os.getenv("TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
+
 LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")
 LOG_MAX_BYTES: int = _int("LOG_MAX_BYTES", 5_242_880)
 LOG_BACKUP_COUNT: int = _int("LOG_BACKUP_COUNT", 3)

@@ -64,6 +64,20 @@ CREATE TABLE IF NOT EXISTS token_metrics (
     score           REAL,
     PRIMARY KEY (token_address, chain_id)
 );
+
+CREATE TABLE IF NOT EXISTS positions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_address   TEXT NOT NULL,
+    chain_id        TEXT NOT NULL,
+    buy_amount_sol  REAL NOT NULL,
+    token_amount    INTEGER,
+    buy_signature   TEXT,
+    sell_signature  TEXT,
+    bought_at       REAL NOT NULL,
+    sold_at         REAL,
+    sell_amount_sol REAL,
+    status          TEXT DEFAULT 'open'
+);
 """
 
 
@@ -304,6 +318,61 @@ def cleanup_stale_metrics(hours: int = 24) -> None:
     conn = _connect()
     try:
         conn.execute("DELETE FROM token_metrics WHERE recorded_at < ?", (cutoff,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# -- Trading positions --
+
+def record_position(
+    token_address: str, chain_id: str, buy_amount_sol: float,
+    token_amount: int, buy_signature: str,
+) -> None:
+    """Record a new open position."""
+    conn = _connect()
+    try:
+        conn.execute(
+            """INSERT INTO positions (token_address, chain_id, buy_amount_sol, token_amount, buy_signature, bought_at, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'open')""",
+            (token_address, chain_id, buy_amount_sol, token_amount, buy_signature, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_open_positions_count() -> int:
+    """Count currently open positions."""
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM positions WHERE status = 'open'").fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+def get_open_positions() -> list[dict]:
+    """Get all open positions."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE status = 'open' ORDER BY bought_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def close_position(position_id: int, sell_amount_sol: float, sell_signature: str) -> None:
+    """Mark a position as closed (sold)."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE positions SET status = 'closed', sold_at = ?, sell_amount_sol = ?, sell_signature = ? WHERE id = ?",
+            (time.time(), sell_amount_sol, sell_signature, position_id),
+        )
         conn.commit()
     finally:
         conn.close()
