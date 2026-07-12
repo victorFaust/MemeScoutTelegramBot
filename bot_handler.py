@@ -132,6 +132,42 @@ async def _handle_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Buy failed -- check logs or token address")
 
 
+async def _handle_autobuy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /autobuy command -- toggle auto-buy or set amount."""
+    if not update.message:
+        return
+
+    args = context.args
+    if not args:
+        # Toggle
+        config.AUTO_BUY_ENABLED = not config.AUTO_BUY_ENABLED
+        state = "ENABLED" if config.AUTO_BUY_ENABLED else "DISABLED"
+        await update.message.reply_text(
+            f"Auto-buy {state}\n"
+            f"Amount: ${config.AUTO_BUY_AMOUNT_USD:.0f}\n"
+            f"New pools: {'yes' if config.AUTO_BUY_NEW_POOLS else 'no'}"
+        )
+    elif args[0].startswith("$"):
+        # Set amount
+        try:
+            amount = float(args[0].replace("$", ""))
+            if 0.5 <= amount <= 100:
+                config.AUTO_BUY_AMOUNT_USD = amount
+                await update.message.reply_text(f"Auto-buy amount set to ${amount:.0f}")
+            else:
+                await update.message.reply_text("Amount must be $0.50 - $100")
+        except ValueError:
+            await update.message.reply_text("Usage: /autobuy or /autobuy $5")
+    elif args[0].lower() == "pools":
+        config.AUTO_BUY_NEW_POOLS = not config.AUTO_BUY_NEW_POOLS
+        state = "ENABLED" if config.AUTO_BUY_NEW_POOLS else "DISABLED"
+        await update.message.reply_text(f"Auto-buy new pools: {state}")
+    else:
+        await update.message.reply_text("Usage: /autobuy (toggle) | /autobuy $5 (set amount) | /autobuy pools (toggle new pools)")
+    logger.info("[BOT] Auto-buy: enabled=%s, amount=$%.0f, pools=%s",
+                config.AUTO_BUY_ENABLED, config.AUTO_BUY_AMOUNT_USD, config.AUTO_BUY_NEW_POOLS)
+
+
 async def _handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /stop command -- disable trading."""
     # This sets a runtime flag; doesn't persist across restarts
@@ -149,9 +185,11 @@ async def _handle_status_command(update: Update, context: ContextTypes.DEFAULT_T
 
     lines = [
         f"Trading: {'ENABLED' if config.TRADING_ENABLED else 'DISABLED'}",
+        f"Auto-buy: {'ON' if config.AUTO_BUY_ENABLED else 'OFF'} (${config.AUTO_BUY_AMOUNT_USD:.0f})",
+        f"Auto-buy pools: {'ON' if config.AUTO_BUY_NEW_POOLS else 'OFF'}",
         f"Wallet: `{wallet[:8]}...{wallet[-4:]}`" if wallet else "Wallet: not configured",
         f"Open positions: {positions}/{config.MAX_OPEN_POSITIONS}",
-        f"Trade size: {config.TRADE_AMOUNT_SOL} SOL",
+        f"TP: +{config.TAKE_PROFIT_PCT:.0f}% | SL: {config.STOP_LOSS_PCT:.0f}%",
         f"Daily limit: {config.DAILY_LOSS_LIMIT_SOL} SOL",
         f"Status: {reason}",
     ]
@@ -246,13 +284,14 @@ async def start_bot_handler() -> None:
     # Register handlers
     app.add_handler(CallbackQueryHandler(_handle_buy_callback))
     app.add_handler(CommandHandler("buy", _handle_buy_command))
+    app.add_handler(CommandHandler("autobuy", _handle_autobuy_command))
     app.add_handler(CommandHandler("stop", _handle_stop_command))
     app.add_handler(CommandHandler("status", _handle_status_command))
     app.add_handler(CommandHandler("positions", _handle_positions_command))
     app.add_handler(CommandHandler("sell", _handle_sell_command))
 
     # Start polling for updates (non-blocking)
-    logger.info("[BOT] Starting Telegram handler (commands: /buy, /sell, /positions, /status, /stop)")
+    logger.info("[BOT] Telegram handler started (commands: /buy, /autobuy, /sell, /positions, /status, /stop)")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)

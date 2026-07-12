@@ -56,6 +56,11 @@ TAKE_PROFIT_PCT: float = _float("TAKE_PROFIT_PCT", 100.0)  # Sell at +100% (2x)
 STOP_LOSS_PCT: float = _float("STOP_LOSS_PCT", -30.0)      # Sell at -30%
 EXIT_CHECK_INTERVAL: int = _int("EXIT_CHECK_INTERVAL", 30)  # Check exits every 30s
 
+# Auto-buy (fully autonomous mode)
+AUTO_BUY_ENABLED: bool = os.getenv("AUTO_BUY_ENABLED", "false").lower() in ("1", "true", "yes")
+AUTO_BUY_AMOUNT_USD: float = _float("AUTO_BUY_AMOUNT_USD", 3.0)
+AUTO_BUY_NEW_POOLS: bool = os.getenv("AUTO_BUY_NEW_POOLS", "false").lower() in ("1", "true", "yes")
+
 LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")
 LOG_MAX_BYTES: int = _int("LOG_MAX_BYTES", 5_242_880)
 LOG_BACKUP_COUNT: int = _int("LOG_BACKUP_COUNT", 3)
