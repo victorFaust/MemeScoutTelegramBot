@@ -21,9 +21,43 @@ JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
+# Cached SOL price
+_sol_price_usd: float = 0.0
+_sol_price_updated: float = 0.0
+
 # Track daily spending
 _daily_spent_sol: float = 0.0
 _daily_reset_time: float = 0.0
+
+
+def get_sol_price() -> float:
+    """Get current SOL price in USD. Cached for 60 seconds."""
+    global _sol_price_usd, _sol_price_updated
+    if time.time() - _sol_price_updated < 60 and _sol_price_usd > 0:
+        return _sol_price_usd
+    try:
+        # Use DexScreener's SOL/USDC pair price (reliable, no key needed)
+        resp = requests.get(
+            "https://api.dexscreener.com/latest/dex/pairs/solana/8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj",
+            timeout=5
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        pair = data.get("pair") or data.get("pairs", [{}])[0] if isinstance(data, dict) else {}
+        price = float(pair.get("priceUsd", 0) or 0)
+        if price > 0:
+            _sol_price_usd = price
+            _sol_price_updated = time.time()
+        return _sol_price_usd or 170.0
+    except Exception as e:
+        logger.warning("[TRADE] Failed to fetch SOL price: %s", e)
+        return _sol_price_usd or 170.0  # fallback
+
+
+def usd_to_sol(usd_amount: float) -> float:
+    """Convert USD amount to SOL."""
+    price = get_sol_price()
+    return usd_amount / price if price > 0 else 0.0
 
 
 def _reset_daily_if_needed() -> None:

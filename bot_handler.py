@@ -18,20 +18,33 @@ logger = logging.getLogger(__name__)
 
 
 async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle buy button press."""
+    """Handle buy button press. Supports both 'buy:{token}' and 'buyusd:{amount}:{token}'."""
     query = update.callback_query
     if not query or not query.data:
         return
 
     await query.answer()  # Acknowledge the button press
 
-    # Parse callback data: "buy:{token_address}"
-    parts = query.data.split(":", 1)
-    if len(parts) != 2 or parts[0] != "buy":
+    # Parse callback data
+    parts = query.data.split(":")
+    if len(parts) == 3 and parts[0] == "buyusd":
+        # Format: buyusd:{usd_amount}:{token_address}
+        try:
+            usd_amount = float(parts[1])
+        except ValueError:
+            return
+        token_mint = parts[2]
+        amount_sol = executor.usd_to_sol(usd_amount)
+        display_amount = f"${usd_amount:.0f} ({amount_sol:.3f} SOL)"
+    elif len(parts) == 2 and parts[0] == "buy":
+        # Legacy format: buy:{token_address}
+        token_mint = parts[1]
+        amount_sol = config.TRADE_AMOUNT_SOL
+        display_amount = f"{amount_sol} SOL"
+    else:
         await query.edit_message_reply_markup(reply_markup=None)
         return
 
-    token_mint = parts[1]
     user_id = str(query.from_user.id) if query.from_user else ""
 
     # Only allow the configured chat owner to trade
@@ -49,28 +62,74 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # Execute the buy
+    sol_price = executor.get_sol_price()
     await query.edit_message_text(
-        text=query.message.text + "\n\n_Executing buy..._",
+        text=query.message.text + f"\n\n_Buying {display_amount} (SOL=${sol_price:.0f})..._",
         parse_mode="Markdown",
     )
 
-    result = await asyncio.to_thread(executor.buy_token, token_mint)
+    result = await asyncio.to_thread(executor.buy_token, token_mint, amount_sol)
 
     if result:
         sig = result.get("signature", "")[:16]
-        amount = result.get("amount_sol", 0)
+        spent = result.get("amount_sol", 0)
         impact = result.get("price_impact_pct", 0)
+        usd_spent = spent * sol_price
         await query.edit_message_text(
-            text=query.message.text.replace("_Executing buy..._", "") +
-                 f"\n\n_Bought {amount} SOL (impact: {impact:.1f}%, tx: {sig}...)_",
+            text=query.message.text.replace(f"_Buying {display_amount} (SOL=${sol_price:.0f})..._", "") +
+                 f"\n\n_Bought ${usd_spent:.0f} ({spent:.3f} SOL) | impact: {impact:.1f}% | tx: {sig}..._",
             parse_mode="Markdown",
         )
     else:
         await query.edit_message_text(
-            text=query.message.text.replace("_Executing buy..._", "") +
+            text=query.message.text.replace(f"_Buying {display_amount} (SOL=${sol_price:.0f})..._", "") +
                  "\n\n_Buy failed -- check logs_",
             parse_mode="Markdown",
         )
+
+
+async def _handle_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /buy <token_address> <$amount> command for custom buys."""
+    if not update.message:
+        return
+
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text("Usage: /buy <token_address> <$amount>\nExample: /buy 7NTs9F...pump $25")
+        return
+
+    token_mint = args[0]
+    amount_str = args[1].replace("$", "").replace(",", "")
+
+    try:
+        usd_amount = float(amount_str)
+    except ValueError:
+        await update.message.reply_text("Invalid amount. Use: /buy <token> $25")
+        return
+
+    if usd_amount <= 0 or usd_amount > 500:
+        await update.message.reply_text("Amount must be between $1 and $500")
+        return
+
+    amount_sol = executor.usd_to_sol(usd_amount)
+    sol_price = executor.get_sol_price()
+
+    allowed, reason = executor.can_trade()
+    if not allowed:
+        await update.message.reply_text(f"Buy blocked: {reason}")
+        return
+
+    await update.message.reply_text(f"Buying ${usd_amount:.0f} ({amount_sol:.3f} SOL @ ${sol_price:.0f}/SOL)...")
+
+    result = await asyncio.to_thread(executor.buy_token, token_mint, amount_sol)
+    if result:
+        sig = result.get("signature", "")[:16]
+        impact = result.get("price_impact_pct", 0)
+        await update.message.reply_text(
+            f"Bought ${usd_amount:.0f} ({amount_sol:.3f} SOL) | impact: {impact:.1f}% | tx: {sig}..."
+        )
+    else:
+        await update.message.reply_text("Buy failed -- check logs or token address")
 
 
 async def _handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -186,13 +245,14 @@ async def start_bot_handler() -> None:
 
     # Register handlers
     app.add_handler(CallbackQueryHandler(_handle_buy_callback))
+    app.add_handler(CommandHandler("buy", _handle_buy_command))
     app.add_handler(CommandHandler("stop", _handle_stop_command))
     app.add_handler(CommandHandler("status", _handle_status_command))
     app.add_handler(CommandHandler("positions", _handle_positions_command))
     app.add_handler(CommandHandler("sell", _handle_sell_command))
 
     # Start polling for updates (non-blocking)
-    logger.info("[BOT] Starting Telegram callback handler (commands: /stop, /status, /positions, /sell)")
+    logger.info("[BOT] Starting Telegram handler (commands: /buy, /sell, /positions, /status, /stop)")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
