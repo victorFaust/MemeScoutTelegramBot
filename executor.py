@@ -389,6 +389,42 @@ def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | N
     return result
 
 
+def sell_partial(position_id: int, token_mint: str, token_amount: int, sell_pct: float) -> dict | None:
+    """Sell a percentage of a position. Updates remaining token_amount in DB.
+    
+    sell_pct: 0-100, e.g. 50 = sell half
+    """
+    if not config.TRADING_ENABLED:
+        return None
+
+    sell_amount = int(token_amount * (sell_pct / 100))
+    if sell_amount <= 0:
+        return None
+
+    quote = get_sell_quote(token_mint, sell_amount)
+    if quote is None:
+        return None
+
+    result = execute_swap(quote)
+    if result is None:
+        return None
+
+    sol_received = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL
+    remaining = token_amount - sell_amount
+
+    # Update position: reduce token_amount, don't close
+    storage.update_position_tokens(position_id, remaining)
+
+    result["sol_received"] = sol_received
+    result["sold_amount"] = sell_amount
+    result["remaining"] = remaining
+    result["sell_pct"] = sell_pct
+
+    logger.info("[TRADE] Partial sell #%d: %.0f%% sold, %.4f SOL received, %d tokens remaining",
+                position_id, sell_pct, sol_received, remaining)
+    return result
+
+
 def check_position_pnl(position: dict) -> dict | None:
     """Check current PnL for an open position by getting a sell quote.
     

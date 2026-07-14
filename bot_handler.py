@@ -26,9 +26,9 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Portfolio", callback_data="menu:positions"),
          InlineKeyboardButton("Wallet", callback_data="menu:wallet")],
-        [InlineKeyboardButton("Auto-Buy: " + ("ON" if config.AUTO_BUY_ENABLED else "OFF"), callback_data="menu:autobuy"),
+        [InlineKeyboardButton("Watchlist", callback_data="menu:watchlist"),
          InlineKeyboardButton("Settings", callback_data="menu:settings")],
-        [InlineKeyboardButton("Sell All", callback_data="menu:sellall"),
+        [InlineKeyboardButton("Auto-Buy: " + ("ON" if config.AUTO_BUY_ENABLED else "OFF"), callback_data="menu:autobuy"),
          InlineKeyboardButton("Stop Trading", callback_data="menu:stop")],
     ])
 
@@ -74,6 +74,8 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await _show_positions(query)
     elif action == "wallet":
         await _show_wallet(query)
+    elif action == "watchlist":
+        await _show_watchlist(query)
     elif action == "autobuy":
         await _toggle_autobuy(query)
     elif action == "settings":
@@ -94,6 +96,10 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
         amount = float(action.split("_")[2])
         config.AUTO_BUY_AMOUNT_USD = amount
         await _show_settings(query)
+    elif action.startswith("unwatch_"):
+        addr = action[8:]
+        storage.remove_from_watchlist(addr)
+        await _show_watchlist(query)
 
 
 async def _show_positions(query) -> None:
@@ -209,6 +215,58 @@ async def _show_wallet(query) -> None:
             InlineKeyboardButton("Back", callback_data="menu:back"),
         ]])
     )
+
+
+async def _show_watchlist(query) -> None:
+    """Show token watchlist with live prices."""
+    watchlist = storage.get_watchlist()
+    if not watchlist:
+        await query.edit_message_text(
+            "WATCHLIST\n━━━━━━━━━━━━━━━━━━\nEmpty. Use /watch <token_address> to add.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu:back")]])
+        )
+        return
+
+    lines = ["WATCHLIST\n"]
+    buttons = []
+
+    for w in watchlist:
+        addr = w["token_address"]
+        symbol = w.get("symbol") or addr[:8]
+        add_price = w.get("price_at_add", 0) or 0
+        add_mc = w.get("mc_at_add", 0) or 0
+
+        # Fetch current price
+        import dexscreener_client as dex
+        pairs = await asyncio.to_thread(dex.fetch_pair_details, "solana", addr)
+        current_price = 0.0
+        current_mc = 0
+        if pairs:
+            current_price = float(pairs[0].get("priceUsd", 0) or 0)
+            current_mc = pairs[0].get("marketCap") or pairs[0].get("fdv") or 0
+            base = pairs[0].get("baseToken", {})
+            symbol = base.get("symbol", symbol)
+
+        # Calculate change since added
+        if add_price > 0 and current_price > 0:
+            change = ((current_price - add_price) / add_price) * 100
+            sign = "+" if change >= 0 else ""
+            emoji = "🟢" if change >= 0 else "🔴"
+        else:
+            change = 0
+            sign = ""
+            emoji = "⚪"
+
+        def _mc(v):
+            return f"${v/1000:.0f}K" if v >= 1000 else f"${v:.0f}"
+
+        lines.append(f"{emoji} ${symbol}: {_mc(add_mc)} -> {_mc(current_mc)} ({sign}{change:.0f}%)")
+        buttons.append(InlineKeyboardButton(f"Remove ${symbol}", callback_data=f"menu:unwatch_{addr}"))
+
+    button_rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+    button_rows.append([InlineKeyboardButton("Back", callback_data="menu:back")])
+
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(button_rows))
 
 
 async def _show_settings(query) -> None:
@@ -462,6 +520,37 @@ async def _handle_sell_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Sell failed")
 
 
+async def _handle_watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /watch <token_address> — add token to watchlist."""
+    if not update.message:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /watch <token_address>")
+        return
+
+    token_addr = args[0]
+
+    # Fetch current data from DexScreener
+    import dexscreener_client as dex
+    pairs = await asyncio.to_thread(dex.fetch_pair_details, "solana", token_addr)
+    price = 0.0
+    mc = 0
+    symbol = token_addr[:8]
+    if pairs:
+        price = float(pairs[0].get("priceUsd", 0) or 0)
+        mc = pairs[0].get("marketCap") or pairs[0].get("fdv") or 0
+        base = pairs[0].get("baseToken", {})
+        symbol = base.get("symbol", symbol)
+
+    storage.add_to_watchlist(token_addr, symbol, price, mc)
+
+    def _mc(v):
+        return f"${v/1000:.0f}K" if v >= 1000 else f"${v:.0f}"
+
+    await update.message.reply_text(f"Added ${symbol} to watchlist\nMC: {_mc(mc)}\nUse /start -> Watchlist to view")
+
+
 # -- Start Bot --
 
 async def start_bot_handler() -> None:
@@ -478,17 +567,18 @@ async def start_bot_handler() -> None:
         BotCommand("positions", "View portfolio & PnL"),
         BotCommand("buy", "Buy token: /buy <address> $5"),
         BotCommand("sell", "Sell: /sell <id> or /sell all"),
-        BotCommand("status", "Wallet & settings"),
+        BotCommand("watch", "Watch token: /watch <address>"),
         BotCommand("autobuy", "Toggle auto-buy"),
         BotCommand("stop", "Emergency stop all trading"),
     ])
 
     # Register handlers
     app.add_handler(CommandHandler("start", _handle_start))
-    app.add_handler(CommandHandler("positions", lambda u, c: _handle_start(u, c)))  # redirects to menu
+    app.add_handler(CommandHandler("positions", lambda u, c: _handle_start(u, c)))
     app.add_handler(CommandHandler("status", lambda u, c: _handle_start(u, c)))
     app.add_handler(CommandHandler("buy", _handle_buy_command))
     app.add_handler(CommandHandler("sell", _handle_sell_command))
+    app.add_handler(CommandHandler("watch", _handle_watch_command))
     app.add_handler(CommandHandler("autobuy", lambda u, c: u.message.reply_text(
         f"Auto-buy: {'ON -> OFF' if config.AUTO_BUY_ENABLED else 'OFF -> ON'}",
     ) if (setattr(config, 'AUTO_BUY_ENABLED', not config.AUTO_BUY_ENABLED) or True) else None))
