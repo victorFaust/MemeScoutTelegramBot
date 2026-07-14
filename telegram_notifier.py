@@ -78,9 +78,9 @@ def build_message(result: dict, safety: dict | None = None) -> str:
     # All alerts are momentum-confirmed now
     prev = result.get("prev_score", 0)
     if prev and prev > 0:
-        header = f"*MOMENTUM CONFIRMED*  --  Score: *{prev:.0f} -> {score}/100*"
+        header = f"\U0001f680 *MOMENTUM*  --  Score: *{prev:.0f} \u2192 {score}/100*"
     else:
-        header = f"*MOMENTUM CONFIRMED*  --  Score: *{score}/100*"
+        header = f"\U0001f680 *NEW ALERT*  --  Score: *{score}/100*"
 
     dex_id = pair.get("dexId", "")
     dex_names = {"raydium": "Raydium", "meteora": "Meteora", "orca": "Orca", "pumpfun": "Pump.fun", "pump": "Pump.fun"}
@@ -88,7 +88,7 @@ def build_message(result: dict, safety: dict | None = None) -> str:
 
     lines = [
         header,
-        f"Chain: `{chain}`" + (f" | DEX: {dex_name}" if dex_name else ""),
+        f"\u26d3 `{chain}`" + (f" | {dex_name}" if dex_name else ""),
         "",
         f"*{name}* (${symbol})",
         "",
@@ -96,13 +96,13 @@ def build_message(result: dict, safety: dict | None = None) -> str:
 
     # For Robinhood Chain, show market cap first and prominently
     if chain_lower == "robinhood":
-        lines.append(f"*Market Cap: {_fmt_num(mc)}*")
-        lines.append(f"Liquidity: {_fmt_num(liq)}")
+        lines.append(f"\U0001f4ca *Market Cap: {_fmt_num(mc)}*")
+        lines.append(f"\U0001f4a7 Liquidity: {_fmt_num(liq)}")
     else:
-        lines.append(f"Liquidity: {_fmt_num(liq)}")
-        lines.append(f"Market Cap: {_fmt_num(mc)}")
+        lines.append(f"\U0001f4a7 Liquidity: {_fmt_num(liq)}")
+        lines.append(f"\U0001f4ca Market Cap: {_fmt_num(mc)}")
 
-    lines.append(f"Volume 24h: {_fmt_num(vol_24h)}")
+    lines.append(f"\U0001f4c8 Volume 24h: {_fmt_num(vol_24h)}")
 
     # Token age
     pair_created = pair.get("pairCreatedAt")
@@ -115,21 +115,22 @@ def build_message(result: dict, safety: dict | None = None) -> str:
             age_str = f"{age_hours:.0f}h"
         else:
             age_str = f"{age_hours / 24:.1f}d"
-        lines.append(f"Age: {age_str}")
+        lines.append(f"\u23f0 Age: {age_str}")
 
     lines.append("")
-    lines.append(f"1h: {_fmt_pct(pc.get('h1'))}  |  6h: {_fmt_pct(pc.get('h6'))}  |  24h: {_fmt_pct(pc.get('h24'))}")
-    lines.append(f"Buys/Sells (1h): {buy_ratio}")
+    lines.append(f"\U0001f4c9 1h: {_fmt_pct(pc.get('h1'))}  |  6h: {_fmt_pct(pc.get('h6'))}  |  24h: {_fmt_pct(pc.get('h24'))}")
+    lines.append(f"\U0001f6d2 Buys/Sells (1h): {buy_ratio}")
 
     # Safety check section
     if safety:
         lines.append("")
         if safety.get("check_failed"):
-            lines.append("-- SAFETY: check unavailable --")
+            lines.append("\u26a0\ufe0f SAFETY: check unavailable")
         else:
             risk = safety.get("risk_label", "N/A")
-            risk_icon = {"LOW": "LOW", "MEDIUM": "MEDIUM", "HIGH": "HIGH"}.get(risk, "???")
-            lines.append(f"-- SAFETY: {risk_icon} risk --")
+            risk_icons = {"LOW": "\U0001f7e2", "MEDIUM": "\U0001f7e1", "HIGH": "\U0001f534"}
+            risk_emoji = risk_icons.get(risk, "\u2753")
+            lines.append(f"{risk_emoji} SAFETY: {risk} risk")
 
             buy_tax = safety.get("buy_tax_pct")
             sell_tax = safety.get("sell_tax_pct")
@@ -140,7 +141,9 @@ def build_message(result: dict, safety: dict | None = None) -> str:
 
             mint = safety.get("mint_authority_active")
             if mint is not None:
-                lines.append(f"Mint authority: {'ACTIVE' if mint else 'Renounced'}")
+                mint_emoji = "\U0001f6a8" if mint else "\u2705"
+                mint_text = "ACTIVE" if mint else "Renounced"
+                lines.append(f"{mint_emoji} Mint: {mint_text}")
 
             top10 = safety.get("top10_holder_pct")
             if top10 is not None:
@@ -151,7 +154,7 @@ def build_message(result: dict, safety: dict | None = None) -> str:
         if rc_score is not None:
             lp_locked = safety.get("lp_locked_pct", 0)
             rc_risks = safety.get("risk_count", 0)
-            lines.append(f"RugCheck: {rc_score:.0%} safe | LP locked: {lp_locked:.0f}%")
+            lines.append(f"\U0001f6e1 RugCheck: {rc_score:.0%} safe | LP: {lp_locked:.0f}%")
             if rc_risks > 0:
                 risk_names = safety.get("risks", [])
                 lines.append(f"Risks: {', '.join(risk_names[:3])}")
@@ -164,14 +167,14 @@ def build_message(result: dict, safety: dict | None = None) -> str:
             quality = safety.get("buy_quality", 0)
             top1 = safety.get("top1_pct", 0)
             holders_min = safety.get("holder_count_min", 0)
-            lines.append(f"Holders: {holders_min}+ | Top wallet: {top1:.0f}%")
-            lines.append(f"Unique buyers: {unique_buyers} (quality: {quality:.0%})")
+            lines.append(f"\U0001f465 Holders: {holders_min}+ | Top wallet: {top1:.0f}%")
+            lines.append(f"\U0001f4b0 Unique buyers: {unique_buyers} (quality: {quality:.0%})")
             creates = safety.get("creator_token_creates")
             if creates is not None:
                 lines.append(f"Creator: {creates} tokens deployed")
 
     lines.append("")
-    lines.append(f"Score: *{score}/100*")
+    lines.append(f"\u2b50 Score: *{score}/100*")
 
     if dex_url:
         lines.append(f"[View on DexScreener]({dex_url})")
@@ -246,14 +249,14 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
     dex_name = dex_names.get(dex_id.lower(), dex_id.capitalize()) if dex_id else "Unknown"
 
     lines = [
-        f"*NEW POOL*  --  ${symbol}",
-        f"Chain: `SOLANA` | DEX: {dex_name}",
+        f"\U0001f195 *NEW POOL*  --  ${symbol}",
+        f"\u26d3 `SOLANA` | {dex_name}",
         "",
-        f"Token: `{token_addr}`",
-        f"Liquidity: {_fmt_num(liq_usd)}",
+        f"\U0001f4cb `{token_addr}`",
+        f"\U0001f4a7 Liquidity: {_fmt_num(liq_usd)}",
     ]
     if mc:
-        lines.append(f"Market Cap: {_fmt_num(mc)}")
+        lines.append(f"\U0001f4ca Market Cap: {_fmt_num(mc)}")
 
     # Token age
     pair_created = pair_data.get("pairCreatedAt")
@@ -266,15 +269,15 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
             age_str = f"{age_hours:.0f}h"
         else:
             age_str = f"{age_hours / 24:.1f}d"
-        lines.append(f"Age: {age_str}")
+        lines.append(f"\u23f0 Age: {age_str}")
 
-    lines.append(f"Activity (90s): {total_txns} txns ({buys} buys)")
+    lines.append(f"\U0001f525 Activity (90s): {total_txns} txns ({buys} buys)")
 
     if rc_data:
         rc_score = rc_data.get("rugcheck_score")
         lp_locked = rc_data.get("lp_locked_pct", 0)
         if rc_score is not None:
-            lines.append(f"RugCheck: {rc_score:.0%} safe | LP: {lp_locked:.0f}%")
+            lines.append(f"\U0001f6e1 RugCheck: {rc_score:.0%} safe | LP: {lp_locked:.0f}%")
 
     lines.append("")
     lines.append(f"[View on DexScreener]({dex_url})")
