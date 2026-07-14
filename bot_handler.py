@@ -402,6 +402,15 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         token_mint = parts[2]
         amount_sol = executor.usd_to_sol(usd_amount)
         display_amount = f"${usd_amount:.0f} ({amount_sol:.3f} SOL)"
+    elif len(parts) == 2 and parts[0] == "buycustom":
+        # Custom amount -- ask user to reply with amount
+        token_mint = parts[1]
+        context.user_data["pending_buy_token"] = token_mint
+        await query.edit_message_text(
+            query.message.text + "\n\nType the amount in $ (e.g. 2.5):",
+            parse_mode="Markdown",
+        )
+        return
     elif len(parts) == 2 and parts[0] == "buy":
         token_mint = parts[1]
         amount_sol = config.TRADE_AMOUNT_SOL
@@ -443,6 +452,55 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "\n\nBuy failed -- check logs",
             parse_mode="Markdown",
         )
+
+
+# -- Text input handler (for custom buy amounts) --
+
+async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages -- used for custom buy amount input."""
+    if not update.message or not update.message.text:
+        return
+
+    # Check if there's a pending custom buy
+    token_mint = context.user_data.get("pending_buy_token")
+    if not token_mint:
+        return  # No pending action, ignore
+
+    text = update.message.text.strip().replace("$", "").replace(",", "")
+    try:
+        usd_amount = float(text)
+    except ValueError:
+        await update.message.reply_text("Invalid amount. Send a number (e.g. 2.5)")
+        return
+
+    if usd_amount <= 0 or usd_amount > 100:
+        await update.message.reply_text("Amount must be $0.50 - $100")
+        return
+
+    # Clear pending state
+    del context.user_data["pending_buy_token"]
+
+    # Execute buy
+    amount_sol = executor.usd_to_sol(usd_amount)
+    allowed, reason = executor.can_trade()
+    if not allowed:
+        await update.message.reply_text(f"Buy blocked: {reason}")
+        return
+
+    sol_price = executor.get_sol_price()
+    await update.message.reply_text(f"Buying ${usd_amount:.2f} ({amount_sol:.4f} SOL)...")
+
+    result = await asyncio.to_thread(executor.buy_token, token_mint, amount_sol)
+    if result:
+        sig = result.get("signature", "")[:16]
+        impact = result.get("price_impact_pct", 0)
+        await update.message.reply_text(
+            f"Bought ${usd_amount:.2f} ({amount_sol:.4f} SOL)\n"
+            f"Impact: {impact:.1f}%\n"
+            f"Tx: {sig}..."
+        )
+    else:
+        await update.message.reply_text("Buy failed -- check logs")
 
 
 # -- Legacy text commands --
@@ -588,6 +646,7 @@ async def start_bot_handler() -> None:
         u.message.reply_text("STOPPED. All trading disabled.")
     )[-1]))
     app.add_handler(CallbackQueryHandler(_handle_buy_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_text_input))
 
     logger.info("[BOT] Telegram UI started with command menu")
     await app.initialize()
