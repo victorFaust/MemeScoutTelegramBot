@@ -337,11 +337,20 @@ async def _snapshot_loop() -> None:
 
 
 async def _exit_monitor_loop() -> None:
-    """Auto-exit monitor: checks open positions for take-profit or stop-loss."""
+    """Auto-exit monitor with trailing stop-loss.
+    
+    Trailing SL: tracks the peak PnL for each position.
+    If price drops TRAIL_STOP_PCT from the peak, sells.
+    E.g., peak was +80%, trail is 15% → sells if drops to +65%.
+    """
     import executor
 
-    logger.info("[EXIT] Auto-exit monitor started (TP=+%.0f%%, SL=%.0f%%, interval=%ds)",
-                config.TAKE_PROFIT_PCT, config.STOP_LOSS_PCT, config.EXIT_CHECK_INTERVAL)
+    trail_pct = abs(config.STOP_LOSS_PCT)  # reuse SL value as trail distance
+    logger.info("[EXIT] Auto-exit started (TP=+%.0f%%, Trail=%.0f%% from peak, interval=%ds)",
+                config.TAKE_PROFIT_PCT, trail_pct, config.EXIT_CHECK_INTERVAL)
+
+    # Track peak PnL per position ID
+    peak_pnl: dict[int, float] = {}
 
     while True:
         await asyncio.sleep(config.EXIT_CHECK_INTERVAL)
@@ -351,7 +360,12 @@ async def _exit_monitor_loop() -> None:
 
         positions = storage.get_open_positions()
         if not positions:
+            peak_pnl.clear()
             continue
+
+        # Clean up peaks for closed positions
+        open_ids = {p["id"] for p in positions}
+        peak_pnl = {k: v for k, v in peak_pnl.items() if k in open_ids}
 
         for pos in positions:
             try:
@@ -360,39 +374,107 @@ async def _exit_monitor_loop() -> None:
                     continue
 
                 pnl_pct = pnl["pnl_pct"]
-                token = pos.get("token_address", "?")[:16]
+                pos_id = pos["id"]
+                token = pos.get("token_symbol") or pos.get("token_address", "?")[:12]
 
-                # Take profit
+                # Update peak
+                prev_peak = peak_pnl.get(pos_id, pnl_pct)
+                if pnl_pct > prev_peak:
+                    peak_pnl[pos_id] = pnl_pct
+                    prev_peak = pnl_pct
+
+                # Take profit — partial sell (sell PARTIAL_SELL_PCT, let rest ride with trail)
                 if pnl_pct >= config.TAKE_PROFIT_PCT:
-                    logger.info("[EXIT] TAKE PROFIT: %s at +%.1f%% (%.4f SOL)",
-                                token, pnl_pct, pnl["current_value_sol"])
+                    sell_pct = config.PARTIAL_SELL_PCT
+                    logger.info("[EXIT] TAKE PROFIT: $%s at +%.0f%% (selling %.0f%%)", token, pnl_pct, sell_pct)
                     result = await asyncio.to_thread(
-                        executor.sell_token, pos["id"], pos["token_address"], pos["token_amount"]
+                        executor.sell_partial, pos_id, pos["token_address"], pos["token_amount"], sell_pct
                     )
                     if result:
                         await tg.send_trade_notification(
-                            f"SOLD (TP): +{pnl_pct:.0f}% | Received {result['sol_received']:.4f} SOL",
+                            f"PARTIAL SELL (TP +{pnl_pct:.0f}%) ${token} | Sold {sell_pct:.0f}% | {result['sol_received']:.4f} SOL | {result['remaining']} tokens left",
                             pos["token_address"]
                         )
+                        # Set peak for trailing the remaining position
+                        peak_pnl[pos_id] = pnl_pct
+                    continue
 
-                # Stop loss
-                elif pnl_pct <= config.STOP_LOSS_PCT:
-                    logger.info("[EXIT] STOP LOSS: %s at %.1f%% (%.4f SOL)",
-                                token, pnl_pct, pnl["current_value_sol"])
+                # Trailing stop-loss: sell if dropped trail_pct from peak
+                # Only activate trailing after position is in profit (peak > 0)
+                if prev_peak > 10 and (prev_peak - pnl_pct) >= trail_pct:
+                    logger.info("[EXIT] TRAIL STOP: $%s peak=+%.0f%% now=+%.0f%% (dropped %.0f%%)",
+                                token, prev_peak, pnl_pct, prev_peak - pnl_pct)
                     result = await asyncio.to_thread(
-                        executor.sell_token, pos["id"], pos["token_address"], pos["token_amount"]
+                        executor.sell_token, pos_id, pos["token_address"], pos["token_amount"]
                     )
                     if result:
                         await tg.send_trade_notification(
-                            f"SOLD (SL): {pnl_pct:.0f}% | Received {result['sol_received']:.4f} SOL",
+                            f"SOLD (Trail) ${token} | Peak +{prev_peak:.0f}% -> +{pnl_pct:.0f}% | {result['sol_received']:.4f} SOL",
+                            pos["token_address"]
+                        )
+                    continue
+
+                # Hard stop-loss (below entry, no trailing)
+                if pnl_pct <= config.STOP_LOSS_PCT:
+                    logger.info("[EXIT] STOP LOSS: $%s at %.0f%%", token, pnl_pct)
+                    result = await asyncio.to_thread(
+                        executor.sell_token, pos_id, pos["token_address"], pos["token_amount"]
+                    )
+                    if result:
+                        await tg.send_trade_notification(
+                            f"SOLD (SL {pnl_pct:.0f}%) ${token} | {result['sol_received']:.4f} SOL",
                             pos["token_address"]
                         )
 
-                # Small delay between position checks
                 await asyncio.sleep(2)
 
             except Exception as e:
                 logger.error("[EXIT] Error checking position #%d: %s", pos.get("id", 0), e)
+
+
+async def _pnl_notification_loop() -> None:
+    """Send periodic PnL updates for open positions (every 15 min)."""
+    import executor
+
+    while True:
+        await asyncio.sleep(900)  # 15 minutes
+
+        if not config.TRADING_ENABLED:
+            continue
+
+        positions = storage.get_open_positions()
+        if not positions:
+            continue
+
+        lines = ["PORTFOLIO UPDATE\n"]
+        total_invested = 0.0
+        total_current = 0.0
+
+        for pos in positions:
+            try:
+                pnl = await asyncio.to_thread(executor.check_position_pnl, pos)
+                symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
+                amount_sol = pos.get("buy_amount_sol", 0)
+                total_invested += amount_sol
+
+                if pnl:
+                    current_val = pnl["current_value_sol"]
+                    pnl_pct = pnl["pnl_pct"]
+                    total_current += current_val
+                    emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                    sign = "+" if pnl_pct >= 0 else ""
+                    lines.append(f"{emoji} ${symbol}: {sign}{pnl_pct:.0f}% ({current_val:.4f} SOL)")
+                else:
+                    lines.append(f"⚪ ${symbol}: N/A")
+                    total_current += amount_sol
+            except Exception:
+                continue
+
+        if total_invested > 0:
+            total_pnl = (total_current - total_invested) / total_invested * 100
+            sign = "+" if total_pnl >= 0 else ""
+            lines.append(f"\nTotal: {sign}{total_pnl:.0f}% | {total_current:.4f} SOL")
+            await tg.send_trade_notification("\n".join(lines))
 
 
 async def _status_log_loop() -> None:
@@ -463,6 +545,7 @@ async def main() -> None:
     asyncio.create_task(_status_log_loop())
     asyncio.create_task(_cleanup_loop())
     asyncio.create_task(_exit_monitor_loop())
+    asyncio.create_task(_pnl_notification_loop())
 
     # Start new token discovery (RugCheck feed)
     listener = pool_listener.PoolListener(on_new_pool=_handle_new_pool)

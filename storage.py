@@ -81,6 +81,14 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_mc        REAL,
     token_symbol    TEXT
 );
+
+CREATE TABLE IF NOT EXISTS watchlist (
+    token_address TEXT PRIMARY KEY,
+    symbol        TEXT,
+    added_at      REAL NOT NULL,
+    price_at_add  REAL,
+    mc_at_add     REAL
+);
 """
 
 
@@ -381,5 +389,57 @@ def close_position(position_id: int, sell_amount_sol: float, sell_signature: str
             (time.time(), sell_amount_sol, sell_signature, position_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def update_position_tokens(position_id: int, new_token_amount: int) -> None:
+    """Update remaining token amount after partial sell."""
+    conn = _connect()
+    try:
+        if new_token_amount <= 0:
+            conn.execute(
+                "UPDATE positions SET status = 'closed', sold_at = ? WHERE id = ?",
+                (time.time(), position_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE positions SET token_amount = ? WHERE id = ?",
+                (new_token_amount, position_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# -- Watchlist --
+
+def add_to_watchlist(token_address: str, symbol: str = "", price: float = 0, mc: float = 0) -> None:
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO watchlist (token_address, symbol, added_at, price_at_add, mc_at_add) VALUES (?, ?, ?, ?, ?)",
+            (token_address, symbol, time.time(), price, mc),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def remove_from_watchlist(token_address: str) -> None:
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM watchlist WHERE token_address = ?", (token_address,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_watchlist() -> list[dict]:
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT * FROM watchlist ORDER BY added_at DESC").fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
