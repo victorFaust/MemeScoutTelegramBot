@@ -197,12 +197,13 @@ async def send_alert(result: dict, safety: dict | None = None) -> bool:
         token_addr = base.get("address", "")
         if token_addr:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-            reply_markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton("$1", callback_data=f"buyusd:1:{token_addr}"),
-                InlineKeyboardButton("$3", callback_data=f"buyusd:3:{token_addr}"),
-                InlineKeyboardButton("$5", callback_data=f"buyusd:5:{token_addr}"),
-                InlineKeyboardButton("$8", callback_data=f"buyusd:8:{token_addr}"),
-            ]])
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("$1", callback_data=f"buyusd:1:{token_addr}"),
+                 InlineKeyboardButton("$3", callback_data=f"buyusd:3:{token_addr}"),
+                 InlineKeyboardButton("$5", callback_data=f"buyusd:5:{token_addr}"),
+                 InlineKeyboardButton("$8", callback_data=f"buyusd:8:{token_addr}")],
+                [InlineKeyboardButton("Custom $...", callback_data=f"buycustom:{token_addr}")],
+            ])
 
     try:
         bot = _get_bot()
@@ -288,12 +289,13 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
     reply_markup = None
     if config.TRADING_ENABLED and token_addr:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        reply_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("$1", callback_data=f"buyusd:1:{token_addr}"),
-            InlineKeyboardButton("$3", callback_data=f"buyusd:3:{token_addr}"),
-            InlineKeyboardButton("$5", callback_data=f"buyusd:5:{token_addr}"),
-            InlineKeyboardButton("$8", callback_data=f"buyusd:8:{token_addr}"),
-        ]])
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("$1", callback_data=f"buyusd:1:{token_addr}"),
+             InlineKeyboardButton("$3", callback_data=f"buyusd:3:{token_addr}"),
+             InlineKeyboardButton("$5", callback_data=f"buyusd:5:{token_addr}"),
+             InlineKeyboardButton("$8", callback_data=f"buyusd:8:{token_addr}")],
+            [InlineKeyboardButton("Custom $...", callback_data=f"buycustom:{token_addr}")],
+        ])
 
     try:
         bot = _get_bot()
