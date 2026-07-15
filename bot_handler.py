@@ -963,6 +963,116 @@ async def _handle_trade_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("\n".join(lines))
 
 
+async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /report [days] — send performance report to Telegram."""
+    if not update.message:
+        return
+
+    days = 7
+    if context.args:
+        try:
+            days = int(context.args[0])
+        except ValueError:
+            pass
+
+    rows = storage.get_outcomes_for_report(days)
+    if not rows:
+        await update.message.reply_text(f"No alert data in the last {days} days.")
+        return
+
+    total = len(rows)
+    rugged = sum(1 for r in rows if r.get("rugged"))
+    rug_rate = (rugged / total * 100) if total > 0 else 0
+
+    def _pct(a, b):
+        if not a or not b or b <= 0: return None
+        return ((a - b) / b) * 100
+
+    def _fmt(v):
+        if v is None: return "-"
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.1f}%"
+
+    def _stats(window):
+        price_col = f"price_{window}"
+        checked_col = f"checked_{window}"
+        valid = [r for r in rows if r.get(checked_col) and r.get(price_col) and r.get("price_at_alert")]
+        if not valid:
+            return 0, "-", "-", "-"
+        returns = [_pct(r[price_col], r["price_at_alert"]) for r in valid]
+        returns = [r for r in returns if r is not None]
+        if not returns:
+            return 0, "-", "-", "-"
+        wins = sum(1 for r in returns if r > 0)
+        wr = f"{wins/len(returns)*100:.0f}%"
+        avg = _fmt(sum(returns)/len(returns))
+        mx = _fmt(max(returns))
+        return len(returns), wr, avg, mx
+
+    lines = [
+        f"📊 PERFORMANCE REPORT ({days}d)",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Alerts: {total} | Rugged: {rugged} ({rug_rate:.0f}%)",
+        "",
+    ]
+
+    # Win rates by timeframe
+    for window in ["15m", "1h", "6h", "24h"]:
+        n, wr, avg, mx = _stats(window)
+        if n > 0:
+            lines.append(f"  {window}: {wr} win ({n}) | avg {avg} | best {mx}")
+
+    # Top gainers at 1h
+    gainers = []
+    for r in rows:
+        if r.get("checked_1h") and r.get("price_1h") and r.get("price_at_alert"):
+            pct = _pct(r["price_1h"], r["price_at_alert"])
+            if pct is not None:
+                gainers.append((r, pct))
+
+    if gainers:
+        gainers.sort(key=lambda x: x[1], reverse=True)
+        lines += ["", "🏆 TOP GAINERS (1h)"]
+        for r, pct in gainers[:5]:
+            sym = r.get("token_symbol") or "?"
+            score = r.get("score_at_alert", 0)
+            mc = r.get("market_cap_at_alert", 0) or 0
+            mc_str = f"${mc/1000:.0f}K" if mc >= 1000 else f"${mc:.0f}"
+            lines.append(f"  🟢 ${sym}: {_fmt(pct)} | score {score:.0f} | MC {mc_str}")
+
+    # Worst losers at 1h
+    if gainers:
+        losers = sorted(gainers, key=lambda x: x[1])[:3]
+        lines += ["", "📉 WORST (1h)"]
+        for r, pct in losers:
+            sym = r.get("token_symbol") or "?"
+            rug = " 🚩" if r.get("rugged") else ""
+            lines.append(f"  🔴 ${sym}: {_fmt(pct)}{rug}")
+
+    # Score bracket analysis
+    brackets = [(70, 100, "70+"), (55, 70, "55-69"), (40, 55, "40-54")]
+    bracket_lines = []
+    for lo, hi, label in brackets:
+        br = [r for r in rows if lo <= (r.get("score_at_alert") or 0) < hi]
+        if not br:
+            continue
+        valid_1h = [r for r in br if r.get("checked_1h") and r.get("price_1h") and r.get("price_at_alert")]
+        if valid_1h:
+            returns_1h = [_pct(r["price_1h"], r["price_at_alert"]) for r in valid_1h]
+            returns_1h = [r for r in returns_1h if r is not None]
+            if returns_1h:
+                wins = sum(1 for r in returns_1h if r > 0)
+                avg = sum(returns_1h) / len(returns_1h)
+                bracket_lines.append(f"  Score {label}: {len(br)} alerts, {wins/len(returns_1h)*100:.0f}% win, avg {_fmt(avg)}")
+
+    if bracket_lines:
+        lines += ["", "📊 BY SCORE"] + bracket_lines
+
+    lines += ["", "━━━━━━━━━━━━━━━━━━", f"Use /report <days> for custom range"]
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def _handle_sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /sell [id]."""
     if not update.message:
@@ -1049,6 +1159,7 @@ async def start_bot_handler() -> None:
         BotCommand("positions", "View portfolio & PnL"),
         BotCommand("trades", "Trade history & status"),
         BotCommand("trade", "Trade detail: /trade <id>"),
+        BotCommand("report", "Performance report: /report [days]"),
         BotCommand("buy", "Buy token: /buy <address> $5"),
         BotCommand("sell", "Sell: /sell <id> or /sell all"),
         BotCommand("watch", "Watch token: /watch <address>"),
@@ -1062,6 +1173,7 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("status", lambda u, c: _handle_start(u, c)))
     app.add_handler(CommandHandler("trades", _handle_trades_command))
     app.add_handler(CommandHandler("trade", _handle_trade_command))
+    app.add_handler(CommandHandler("report", _handle_report_command))
     app.add_handler(CommandHandler("buy", _handle_buy_command))
     app.add_handler(CommandHandler("sell", _handle_sell_command))
     app.add_handler(CommandHandler("watch", _handle_watch_command))
