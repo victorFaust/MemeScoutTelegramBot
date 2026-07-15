@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS positions (
     status          TEXT DEFAULT 'open',
     entry_price_usd REAL,
     entry_mc        REAL,
-    token_symbol    TEXT
+    token_symbol    TEXT,
+    tx_status       TEXT DEFAULT 'pending'
 );
 
 CREATE TABLE IF NOT EXISTS watchlist (
@@ -96,6 +97,12 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.executescript(_CREATE_TABLES)
+    # Migrate: add tx_status column if missing (existing DBs)
+    try:
+        conn.execute("SELECT tx_status FROM positions LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE positions ADD COLUMN tx_status TEXT DEFAULT 'confirmed'")
+        conn.commit()
     return conn
 
 
@@ -343,18 +350,34 @@ def record_position(
     token_symbol: str = "",
 ) -> None:
     """Record a new open position with entry price and MC."""
-    conn = _connect()
-    try:
-        conn.execute(
-            """INSERT INTO positions (token_address, chain_id, buy_amount_sol, token_amount,
-               buy_signature, bought_at, status, entry_price_usd, entry_mc, token_symbol)
-               VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
-            (token_address, chain_id, buy_amount_sol, token_amount, buy_signature,
-             time.time(), entry_price_usd, entry_mc, token_symbol),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    last_error: Exception | None = None
+    for attempt in range(3):
+        conn = _connect()
+        try:
+            conn.execute(
+                """INSERT INTO positions (token_address, chain_id, buy_amount_sol, token_amount,
+                   buy_signature, bought_at, status, entry_price_usd, entry_mc, token_symbol)
+                   VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
+                (token_address, chain_id, buy_amount_sol, token_amount, buy_signature,
+                 time.time(), entry_price_usd, entry_mc, token_symbol),
+            )
+            conn.commit()
+            logger.info("[DB] Position recorded: %s sig=%s", token_address[:16], buy_signature[:16])
+            return
+        except sqlite3.OperationalError as e:
+            last_error = e
+            if "locked" in str(e).lower() and attempt < 2:
+                wait_s = 0.2 * (attempt + 1)
+                logger.warning("[DB] positions write locked; retrying in %.1fs (attempt %d/3)", wait_s, attempt + 1)
+                time.sleep(wait_s)
+                continue
+            logger.exception("[DB] Failed to record position: %s", e)
+            raise
+        finally:
+            conn.close()
+
+    if last_error:
+        raise last_error
 
 
 def get_open_positions_count() -> int:
@@ -374,6 +397,87 @@ def get_open_positions() -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT * FROM positions WHERE status = 'open' ORDER BY bought_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_recent_positions(limit: int = 5) -> list[dict]:
+    """Get most recent positions (open or closed) for quick trade history in UI."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM positions ORDER BY bought_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_closed_positions(limit: int = 10) -> list[dict]:
+    """Get closed (sold) positions for trade history."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE status = 'closed' ORDER BY sold_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pending_positions() -> list[dict]:
+    """Get positions with unconfirmed transactions."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE tx_status = 'pending' ORDER BY bought_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_position_by_id(position_id: int) -> dict | None:
+    """Get a single position by ID."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM positions WHERE id = ?", (position_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def update_tx_status(position_id: int, status: str) -> None:
+    """Update the transaction confirmation status of a position."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE positions SET tx_status = ? WHERE id = ?",
+            (status, position_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_all_positions_paginated(offset: int = 0, limit: int = 10) -> list[dict]:
+    """Get all positions (any status) sorted by newest first."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM positions ORDER BY bought_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:

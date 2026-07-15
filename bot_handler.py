@@ -8,7 +8,9 @@ Features:
 """
 
 import asyncio
+import datetime
 import logging
+import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
@@ -20,16 +22,40 @@ import storage
 logger = logging.getLogger(__name__)
 
 
+def _is_authorized(update: Update) -> bool:
+    """Allow trading controls only from configured user/chat."""
+    expected = (config.TELEGRAM_CHAT_ID or "").strip()
+    if not expected:
+        return True
+
+    query = update.callback_query
+    msg = update.message or (query.message if query else None)
+    user_id = str(query.from_user.id) if query and query.from_user else (str(update.effective_user.id) if update.effective_user else "")
+    chat_id = str(msg.chat_id) if msg else ""
+    return expected in {user_id, chat_id}
+
+
+async def _safe_edit_message(query, text: str, reply_markup=None) -> None:
+    """Edit callback message and fall back to a reply if edit fails."""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except Exception:
+        logger.exception("[BOT] Failed to edit message; falling back to reply")
+        if query.message:
+            await query.message.reply_text(text, reply_markup=reply_markup)
+
+
 # -- Main Menu --
 
 def _main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Portfolio", callback_data="menu:positions"),
-         InlineKeyboardButton("Wallet", callback_data="menu:wallet")],
-        [InlineKeyboardButton("Watchlist", callback_data="menu:watchlist"),
-         InlineKeyboardButton("Settings", callback_data="menu:settings")],
-        [InlineKeyboardButton("Auto-Buy: " + ("ON" if config.AUTO_BUY_ENABLED else "OFF"), callback_data="menu:autobuy"),
+         InlineKeyboardButton("Trades", callback_data="menu:trades")],
+        [InlineKeyboardButton("Wallet", callback_data="menu:wallet"),
+         InlineKeyboardButton("Watchlist", callback_data="menu:watchlist")],
+        [InlineKeyboardButton("Settings", callback_data="menu:settings"),
          InlineKeyboardButton("Stop Trading", callback_data="menu:stop")],
+        [InlineKeyboardButton("Auto-Buy: " + ("ON" if config.AUTO_BUY_ENABLED else "OFF"), callback_data="menu:autobuy")],
     ])
 
 
@@ -72,6 +98,11 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "positions":
         await _show_positions(query)
+    elif action == "trades":
+        await _show_trades(query)
+    elif action.startswith("trade_"):
+        pos_id = int(action.split("_")[1])
+        await _show_trade_detail(query, pos_id)
     elif action == "wallet":
         await _show_wallet(query)
     elif action == "watchlist":
@@ -106,8 +137,32 @@ async def _show_positions(query) -> None:
     """Show portfolio with live PnL."""
     positions = storage.get_open_positions()
     if not positions:
+        recent = storage.get_recent_positions(limit=5)
+        if not recent:
+            await query.edit_message_text(
+                "No open positions.\n\nBuy tokens from alerts or use /buy <token> $amount",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Back", callback_data="menu:back")
+                ]])
+            )
+            return
+
+        lines = ["No open positions.\n", "Recent trades:\n"]
+        for p in recent:
+            sym = p.get("token_symbol") or p.get("token_address", "")[:8]
+            spent = p.get("buy_amount_sol", 0) or 0
+            got = p.get("sell_amount_sol")
+            status = p.get("status", "open")
+            if got is not None:
+                pnl_sol = got - spent
+                pnl_pct = (pnl_sol / spent * 100) if spent > 0 else 0
+                sign = "+" if pnl_pct >= 0 else ""
+                lines.append(f"${sym}: {sign}{pnl_pct:.0f}% ({sign}{pnl_sol:.4f} SOL)")
+            else:
+                lines.append(f"${sym}: status={status}, buy={spent:.4f} SOL")
+
         await query.edit_message_text(
-            "No open positions.\n\nBuy tokens from alerts or use /buy <token> $amount",
+            "\n".join(lines),
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Back", callback_data="menu:back")
             ]])
@@ -183,6 +238,189 @@ async def _show_positions(query) -> None:
     button_rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
     button_rows.append([InlineKeyboardButton("Sell All", callback_data="menu:sellall"),
                         InlineKeyboardButton("Back", callback_data="menu:back")])
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(button_rows)
+    )
+
+
+async def _show_trades(query) -> None:
+    """Show Trades screen: pending, open, and recent closed trades (Trojan-style)."""
+
+    pending = storage.get_pending_positions()
+    open_pos = storage.get_open_positions()
+    closed = storage.get_closed_positions(limit=10)
+
+    lines = ["TRADES\n━━━━━━━━━━━━━━━━━━\n"]
+    buttons = []
+
+    # -- Pending confirmations --
+    if pending:
+        lines.append("⏳ PENDING CONFIRMATION\n")
+        for p in pending:
+            sym = p.get("token_symbol") or p.get("token_address", "")[:8]
+            age = time.time() - p.get("bought_at", time.time())
+            lines.append(f"  ${sym} | {p.get('buy_amount_sol', 0):.4f} SOL | {age:.0f}s ago")
+            buttons.append(InlineKeyboardButton(f"#{p['id']} ${sym}", callback_data=f"menu:trade_{p['id']}"))
+        lines.append("")
+
+    # -- Open positions --
+    if open_pos:
+        lines.append(f"🟢 OPEN ({len(open_pos)})\n")
+        for p in open_pos:
+            sym = p.get("token_symbol") or p.get("token_address", "")[:8]
+            tx_st = p.get("tx_status", "?")
+            lines.append(f"  ${sym} | {p.get('buy_amount_sol', 0):.4f} SOL | tx: {tx_st}")
+            buttons.append(InlineKeyboardButton(f"#{p['id']} ${sym}", callback_data=f"menu:trade_{p['id']}"))
+        lines.append("")
+
+    # -- Closed trades --
+    if closed:
+        lines.append(f"📋 CLOSED (last {len(closed)})\n")
+        for p in closed:
+            sym = p.get("token_symbol") or p.get("token_address", "")[:8]
+            spent = p.get("buy_amount_sol", 0) or 0
+            got = p.get("sell_amount_sol") or 0
+            pnl_sol = got - spent
+            pnl_pct = (pnl_sol / spent * 100) if spent > 0 else 0
+            sign = "+" if pnl_pct >= 0 else ""
+            emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            lines.append(f"  {emoji} ${sym}: {sign}{pnl_pct:.0f}% ({sign}{pnl_sol:.4f} SOL)")
+            buttons.append(InlineKeyboardButton(f"#{p['id']} ${sym}", callback_data=f"menu:trade_{p['id']}"))
+        lines.append("")
+
+    if not pending and not open_pos and not closed:
+        lines.append("No trades yet.\nBuy tokens from alerts or use /buy <token> $amount")
+
+    # Summary
+    total_trades = len(open_pos) + len(closed) + len(pending)
+    lines.append(f"━━━━━━━━━━━━━━━━━━\nTotal: {total_trades} trades")
+
+    # Button grid (3 per row)
+    button_rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
+    button_rows.append([InlineKeyboardButton("Refresh", callback_data="menu:trades"),
+                        InlineKeyboardButton("Back", callback_data="menu:back")])
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(button_rows)
+    )
+
+
+async def _show_trade_detail(query, pos_id: int) -> None:
+    """Show detailed trade timeline for a single position (like Trojan trade view)."""
+
+    pos = storage.get_position_by_id(pos_id)
+    if not pos:
+        await query.edit_message_text(
+            f"Trade #{pos_id} not found.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu:trades")]])
+        )
+        return
+
+    sym = pos.get("token_symbol") or pos.get("token_address", "")[:8]
+    token_addr = pos.get("token_address", "")
+    status = pos.get("status", "?")
+    tx_status = pos.get("tx_status", "?")
+    buy_sig = pos.get("buy_signature", "")
+    sell_sig = pos.get("sell_signature", "")
+    bought_at = pos.get("bought_at", 0)
+    sold_at = pos.get("sold_at")
+    buy_sol = pos.get("buy_amount_sol", 0)
+    sell_sol = pos.get("sell_amount_sol")
+    entry_price = pos.get("entry_price_usd", 0) or 0
+    entry_mc = pos.get("entry_mc", 0) or 0
+
+    def _mc(v):
+        if not v: return "N/A"
+        return f"${v/1000:.0f}K" if v >= 1000 else f"${v:.0f}"
+
+    def _price(v):
+        if not v: return "N/A"
+        if v < 0.0001: return f"${v:.10f}"
+        if v < 0.01: return f"${v:.6f}"
+        return f"${v:.4f}"
+
+    def _time(ts):
+        if not ts: return "N/A"
+        return datetime.datetime.fromtimestamp(ts).strftime("%m/%d %H:%M:%S")
+
+    def _age(ts):
+        if not ts: return ""
+        secs = time.time() - ts
+        if secs < 60: return f"{secs:.0f}s"
+        if secs < 3600: return f"{secs/60:.0f}m"
+        return f"{secs/3600:.1f}h"
+
+    # Status emoji
+    if status == "open":
+        status_emoji = "🟢 OPEN"
+    elif status == "closed" and sell_sol and sell_sol > buy_sol:
+        status_emoji = "🟢 CLOSED (profit)"
+    elif status == "closed":
+        status_emoji = "🔴 CLOSED"
+    else:
+        status_emoji = f"⚪ {status.upper()}"
+
+    # PnL
+    pnl_line = ""
+    if sell_sol is not None:
+        pnl_sol = sell_sol - buy_sol
+        pnl_pct = (pnl_sol / buy_sol * 100) if buy_sol > 0 else 0
+        sign = "+" if pnl_pct >= 0 else ""
+        pnl_line = f"PnL: {sign}{pnl_pct:.1f}% ({sign}{pnl_sol:.4f} SOL)"
+    elif status == "open":
+        pnl = await asyncio.to_thread(executor.check_position_pnl, pos)
+        if pnl:
+            sign = "+" if pnl["pnl_pct"] >= 0 else ""
+            pnl_line = f"Live PnL: {sign}{pnl['pnl_pct']:.1f}% ({sign}{pnl['pnl_sol']:.4f} SOL)"
+
+    lines = [
+        f"TRADE #{pos_id} — ${sym}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Status: {status_emoji}",
+        f"Tx Confirm: {tx_status}",
+        "",
+        "📥 BUY",
+        f"  Amount: {buy_sol:.4f} SOL",
+        f"  Entry Price: {_price(entry_price)}",
+        f"  Entry MC: {_mc(entry_mc)}",
+        f"  Time: {_time(bought_at)} ({_age(bought_at)} ago)",
+        f"  Sig: {buy_sig[:24]}..." if buy_sig else "  Sig: N/A",
+    ]
+
+    if sell_sig or sold_at:
+        lines += [
+            "",
+            "📤 SELL",
+            f"  Received: {sell_sol:.4f} SOL" if sell_sol else "  Received: N/A",
+            f"  Time: {_time(sold_at)} ({_age(sold_at)} ago)" if sold_at else "  Time: N/A",
+            f"  Sig: {sell_sig[:24]}..." if sell_sig else "  Sig: N/A",
+        ]
+
+    if pnl_line:
+        lines += ["", pnl_line]
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Token: {token_addr[:20]}...",
+        f"Solscan: solscan.io/token/{token_addr[:20]}...",
+    ]
+
+    # Action buttons
+    action_buttons = []
+    if status == "open":
+        action_buttons.append(InlineKeyboardButton(f"Sell ${sym}", callback_data=f"menu:sell_{pos_id}"))
+    if buy_sig:
+        action_buttons.append(InlineKeyboardButton("View Tx", url=f"https://solscan.io/tx/{buy_sig}"))
+
+    button_rows = []
+    if action_buttons:
+        button_rows.append(action_buttons)
+    button_rows.append([InlineKeyboardButton("Back to Trades", callback_data="menu:trades"),
+                        InlineKeyboardButton("Main Menu", callback_data="menu:back")])
 
     await query.edit_message_text(
         "\n".join(lines),
@@ -392,6 +630,7 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await query.answer()
+    logger.info("[BOT] Buy callback received: data=%s", query.data)
 
     parts = query.data.split(":")
     if len(parts) == 3 and parts[0] == "buyusd":
@@ -406,10 +645,8 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         # Custom amount -- ask user to reply with amount
         token_mint = parts[1]
         context.user_data["pending_buy_token"] = token_mint
-        await query.edit_message_text(
-            query.message.text + "\n\nType the amount in $ (e.g. 2.5):",
-            parse_mode="Markdown",
-        )
+        base_text = query.message.text or "Trade"
+        await _safe_edit_message(query, base_text + "\n\nType the amount in $ (e.g. 2.5):")
         return
     elif len(parts) == 2 and parts[0] == "buy":
         token_mint = parts[1]
@@ -418,40 +655,41 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         return
 
-    user_id = str(query.from_user.id) if query.from_user else ""
-    if user_id != config.TELEGRAM_CHAT_ID:
+    if not _is_authorized(update):
+        logger.warning("[BOT] Unauthorized buy attempt: user=%s chat=%s", str(query.from_user.id) if query.from_user else "?", str(query.message.chat_id) if query.message else "?")
         await query.answer("Not authorized", show_alert=True)
         return
 
     allowed, reason = executor.can_trade()
     if not allowed:
+        logger.info("[BOT] Buy blocked by safety rails: %s", reason)
         await query.answer(f"Blocked: {reason}", show_alert=True)
         return
 
     sol_price = executor.get_sol_price()
-    await query.edit_message_text(
-        query.message.text + f"\n\nBuying {display_amount}...",
-        parse_mode="Markdown",
-    )
+    base_text = query.message.text or "Trade"
+    await _safe_edit_message(query, base_text + f"\n\nBuying {display_amount}...")
 
-    result = await asyncio.to_thread(executor.buy_token, token_mint, amount_sol)
+    try:
+        result = await asyncio.to_thread(executor.buy_token, token_mint, amount_sol)
+    except Exception:
+        logger.exception("[BOT] Buy execution crashed for %s", token_mint)
+        await _safe_edit_message(query, base_text + "\n\nBuy failed due to internal error. Please retry.")
+        return
 
     if result:
         sig = result.get("signature", "")[:16]
         spent = result.get("amount_sol", 0)
         impact = result.get("price_impact_pct", 0)
         usd_spent = spent * sol_price
-        await query.edit_message_text(
-            query.message.text.replace(f"Buying {display_amount}...", "") +
-            f"\n\nBought ${usd_spent:.0f} ({spent:.3f} SOL) | impact: {impact:.1f}% | tx: {sig}...",
-            parse_mode="Markdown",
-        )
+        position_recorded = bool(result.get("position_recorded", True))
+        if position_recorded:
+            msg = base_text + f"\n\nBought ${usd_spent:.0f} ({spent:.3f} SOL) | impact: {impact:.1f}% | tx: {sig}...\nAdded to portfolio."
+        else:
+            msg = base_text + f"\n\nTx submitted (${usd_spent:.0f}, {spent:.3f} SOL) | tx: {sig}...\nWarning: portfolio save failed. Check logs."
+        await _safe_edit_message(query, msg)
     else:
-        await query.edit_message_text(
-            query.message.text.replace(f"Buying {display_amount}...", "") +
-            "\n\nBuy failed -- check logs",
-            parse_mode="Markdown",
-        )
+        await _safe_edit_message(query, base_text + "\n\nBuy failed. Check logs for reason.")
 
 
 # -- Text input handler (for custom buy amounts) --
@@ -482,6 +720,7 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Execute buy
     amount_sol = executor.usd_to_sol(usd_amount)
+    logger.info("[BOT] Custom buy requested: token=%s usd=%.2f", token_mint[:16], usd_amount)
     allowed, reason = executor.can_trade()
     if not allowed:
         await update.message.reply_text(f"Buy blocked: {reason}")
@@ -490,15 +729,28 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     sol_price = executor.get_sol_price()
     await update.message.reply_text(f"Buying ${usd_amount:.2f} ({amount_sol:.4f} SOL)...")
 
-    result = await asyncio.to_thread(executor.buy_token, token_mint, amount_sol)
+    try:
+        result = await asyncio.to_thread(executor.buy_token, token_mint, amount_sol)
+    except Exception:
+        logger.exception("[BOT] Custom buy execution crashed for %s", token_mint)
+        await update.message.reply_text("Buy failed due to internal error. Please retry.")
+        return
     if result:
         sig = result.get("signature", "")[:16]
         impact = result.get("price_impact_pct", 0)
-        await update.message.reply_text(
-            f"Bought ${usd_amount:.2f} ({amount_sol:.4f} SOL)\n"
-            f"Impact: {impact:.1f}%\n"
-            f"Tx: {sig}..."
-        )
+        if result.get("position_recorded", True):
+            await update.message.reply_text(
+                f"Bought ${usd_amount:.2f} ({amount_sol:.4f} SOL)\n"
+                f"Impact: {impact:.1f}%\n"
+                f"Tx: {sig}...\n"
+                "Added to portfolio."
+            )
+        else:
+            await update.message.reply_text(
+                f"Tx submitted for ${usd_amount:.2f} ({amount_sol:.4f} SOL)\n"
+                f"Tx: {sig}...\n"
+                "Warning: portfolio save failed."
+            )
     else:
         await update.message.reply_text("Buy failed -- check logs")
 
@@ -531,12 +783,184 @@ async def _handle_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Blocked: {reason}")
         return
 
+    logger.info("[BOT] Command buy requested: token=%s usd=%.2f", token_mint[:16], usd)
     await update.message.reply_text(f"Buying ${usd:.0f} ({amount_sol:.3f} SOL)...")
-    result = await asyncio.to_thread(executor.buy_token, token_mint, amount_sol)
+    try:
+        result = await asyncio.to_thread(executor.buy_token, token_mint, amount_sol)
+    except Exception:
+        logger.exception("[BOT] Command buy execution crashed for %s", token_mint)
+        await update.message.reply_text("Buy failed due to internal error. Please retry.")
+        return
     if result:
-        await update.message.reply_text(f"Bought! tx: {result['signature'][:20]}...")
+        if result.get("position_recorded", True):
+            await update.message.reply_text(f"Bought! tx: {result['signature'][:20]}... (added to portfolio)")
+        else:
+            await update.message.reply_text(f"Tx sent: {result['signature'][:20]}... but portfolio save failed")
     else:
         await update.message.reply_text("Buy failed")
+
+
+async def _handle_bot_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error hook so callback failures are always visible in logs."""
+    logger.exception("[BOT] Unhandled exception in update handler", exc_info=context.error)
+
+
+async def _handle_trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /trades command — show trade history inline."""
+    if not update.message:
+        return
+
+    pending = storage.get_pending_positions()
+    open_pos = storage.get_open_positions()
+    closed = storage.get_closed_positions(limit=10)
+
+    lines = ["TRADES\n━━━━━━━━━━━━━━━━━━\n"]
+
+    if pending:
+        lines.append("⏳ PENDING\n")
+        for p in pending:
+            sym = p.get("token_symbol") or p.get("token_address", "")[:8]
+            age = time.time() - p.get("bought_at", time.time())
+            lines.append(f"  #{p['id']} ${sym} | {p.get('buy_amount_sol', 0):.4f} SOL | {age:.0f}s ago")
+        lines.append("")
+
+    if open_pos:
+        lines.append(f"🟢 OPEN ({len(open_pos)})\n")
+        for p in open_pos:
+            sym = p.get("token_symbol") or p.get("token_address", "")[:8]
+            lines.append(f"  #{p['id']} ${sym} | {p.get('buy_amount_sol', 0):.4f} SOL | tx: {p.get('tx_status', '?')}")
+        lines.append("")
+
+    if closed:
+        lines.append(f"📋 CLOSED (last {len(closed)})\n")
+        for p in closed:
+            sym = p.get("token_symbol") or p.get("token_address", "")[:8]
+            spent = p.get("buy_amount_sol", 0) or 0
+            got = p.get("sell_amount_sol") or 0
+            pnl_sol = got - spent
+            pnl_pct = (pnl_sol / spent * 100) if spent > 0 else 0
+            sign = "+" if pnl_pct >= 0 else ""
+            emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            lines.append(f"  {emoji} #{p['id']} ${sym}: {sign}{pnl_pct:.0f}% ({sign}{pnl_sol:.4f} SOL)")
+        lines.append("")
+
+    if not pending and not open_pos and not closed:
+        lines.append("No trades yet.")
+
+    lines.append("━━━━━━━━━━━━━━━━━━\nUse /trade <id> for details")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _handle_trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /trade <id> — show detailed trade view."""
+    if not update.message:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /trade <id>\nUse /trades to see all trades with IDs.")
+        return
+
+    try:
+        pos_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid trade ID. Use a number from /trades.")
+        return
+
+    pos = storage.get_position_by_id(pos_id)
+    if not pos:
+        await update.message.reply_text(f"Trade #{pos_id} not found.")
+        return
+
+    sym = pos.get("token_symbol") or pos.get("token_address", "")[:8]
+    token_addr = pos.get("token_address", "")
+    status = pos.get("status", "?")
+    tx_status = pos.get("tx_status", "?")
+    buy_sig = pos.get("buy_signature", "")
+    sell_sig = pos.get("sell_signature", "")
+    bought_at = pos.get("bought_at", 0)
+    sold_at = pos.get("sold_at")
+    buy_sol = pos.get("buy_amount_sol", 0)
+    sell_sol = pos.get("sell_amount_sol")
+    entry_price = pos.get("entry_price_usd", 0) or 0
+    entry_mc = pos.get("entry_mc", 0) or 0
+
+    def _mc(v):
+        if not v: return "N/A"
+        return f"${v/1000:.0f}K" if v >= 1000 else f"${v:.0f}"
+
+    def _price(v):
+        if not v: return "N/A"
+        if v < 0.0001: return f"${v:.10f}"
+        if v < 0.01: return f"${v:.6f}"
+        return f"${v:.4f}"
+
+    def _ts(ts):
+        if not ts: return "N/A"
+        return datetime.datetime.fromtimestamp(ts).strftime("%m/%d %H:%M:%S")
+
+    def _age(ts):
+        if not ts: return ""
+        secs = time.time() - ts
+        if secs < 60: return f"{secs:.0f}s"
+        if secs < 3600: return f"{secs/60:.0f}m"
+        return f"{secs/3600:.1f}h"
+
+    # Status line
+    if status == "open":
+        status_line = "🟢 OPEN"
+    elif status == "closed" and sell_sol and sell_sol > buy_sol:
+        status_line = "🟢 CLOSED (profit)"
+    elif status == "closed":
+        status_line = "🔴 CLOSED (loss)"
+    else:
+        status_line = f"⚪ {status.upper()}"
+
+    # PnL
+    pnl_line = ""
+    if sell_sol is not None:
+        pnl_sol_v = sell_sol - buy_sol
+        pnl_pct = (pnl_sol_v / buy_sol * 100) if buy_sol > 0 else 0
+        sign = "+" if pnl_pct >= 0 else ""
+        pnl_line = f"PnL: {sign}{pnl_pct:.1f}% ({sign}{pnl_sol_v:.4f} SOL)"
+    elif status == "open":
+        pnl = await asyncio.to_thread(executor.check_position_pnl, pos)
+        if pnl:
+            sign = "+" if pnl["pnl_pct"] >= 0 else ""
+            pnl_line = f"Live PnL: {sign}{pnl['pnl_pct']:.1f}% ({sign}{pnl['pnl_sol']:.4f} SOL)"
+
+    lines = [
+        f"TRADE #{pos_id} — ${sym}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Status: {status_line}",
+        f"Tx Confirm: {tx_status}",
+        "",
+        "📥 BUY",
+        f"  Amount: {buy_sol:.4f} SOL",
+        f"  Entry Price: {_price(entry_price)}",
+        f"  Entry MC: {_mc(entry_mc)}",
+        f"  Time: {_ts(bought_at)} ({_age(bought_at)} ago)",
+        f"  Tx: solscan.io/tx/{buy_sig[:32]}..." if buy_sig else "  Tx: N/A",
+    ]
+
+    if sell_sig or sold_at:
+        lines += [
+            "",
+            "📤 SELL",
+            f"  Received: {sell_sol:.4f} SOL" if sell_sol else "  Received: N/A",
+            f"  Time: {_ts(sold_at)} ({_age(sold_at)} ago)" if sold_at else "  Time: N/A",
+            f"  Tx: solscan.io/tx/{sell_sig[:32]}..." if sell_sig else "  Tx: N/A",
+        ]
+
+    if pnl_line:
+        lines += ["", pnl_line]
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Token: {token_addr}",
+    ]
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def _handle_sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -623,6 +1047,8 @@ async def start_bot_handler() -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "Main menu"),
         BotCommand("positions", "View portfolio & PnL"),
+        BotCommand("trades", "Trade history & status"),
+        BotCommand("trade", "Trade detail: /trade <id>"),
         BotCommand("buy", "Buy token: /buy <address> $5"),
         BotCommand("sell", "Sell: /sell <id> or /sell all"),
         BotCommand("watch", "Watch token: /watch <address>"),
@@ -634,6 +1060,8 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("start", _handle_start))
     app.add_handler(CommandHandler("positions", lambda u, c: _handle_start(u, c)))
     app.add_handler(CommandHandler("status", lambda u, c: _handle_start(u, c)))
+    app.add_handler(CommandHandler("trades", _handle_trades_command))
+    app.add_handler(CommandHandler("trade", _handle_trade_command))
     app.add_handler(CommandHandler("buy", _handle_buy_command))
     app.add_handler(CommandHandler("sell", _handle_sell_command))
     app.add_handler(CommandHandler("watch", _handle_watch_command))
@@ -647,6 +1075,7 @@ async def start_bot_handler() -> None:
     )[-1]))
     app.add_handler(CallbackQueryHandler(_handle_buy_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_text_input))
+    app.add_error_handler(_handle_bot_error)
 
     logger.info("[BOT] Telegram UI started with command menu")
     await app.initialize()

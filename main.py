@@ -501,6 +501,70 @@ async def _cleanup_loop() -> None:
             logger.exception("Cleanup error")
 
 
+async def _tx_confirmation_loop() -> None:
+    """Poll RPC for pending buy transaction confirmations.
+
+    Checks every 10 seconds. If confirmed/finalized -> update status.
+    If failed -> mark position as 'failed'. If not found after 90s -> mark expired.
+    """
+    import executor
+
+    while True:
+        await asyncio.sleep(10)
+        try:
+            pending = storage.get_pending_positions()
+            if not pending:
+                continue
+
+            for pos in pending:
+                sig = pos.get("buy_signature", "")
+                pos_id = pos.get("id", 0)
+                bought_at = pos.get("bought_at", 0)
+                age_seconds = time.time() - bought_at
+
+                if not sig:
+                    storage.update_tx_status(pos_id, "no_sig")
+                    continue
+
+                status = await asyncio.to_thread(executor.confirm_transaction, sig)
+
+                if status in ("confirmed", "finalized"):
+                    storage.update_tx_status(pos_id, status)
+                    symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
+                    logger.info("[TX] Position #%d ($%s) confirmed: %s", pos_id, symbol, status)
+                    await tg.send_trade_notification(
+                        f"TX CONFIRMED ${symbol}\n"
+                        f"Status: {status}\n"
+                        f"Sig: {sig[:20]}...\n"
+                        f"View: solscan.io/tx/{sig}"
+                    )
+                elif status == "failed":
+                    storage.update_tx_status(pos_id, "failed")
+                    # Close the position since tx failed on-chain
+                    storage.close_position(pos_id, 0, sig)
+                    symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
+                    logger.warning("[TX] Position #%d ($%s) FAILED on-chain", pos_id, symbol)
+                    await tg.send_trade_notification(
+                        f"TX FAILED ${symbol}\n"
+                        f"Your buy transaction failed on-chain.\n"
+                        f"Sig: {sig[:20]}..."
+                    )
+                elif age_seconds > 90 and status == "not_found":
+                    storage.update_tx_status(pos_id, "expired")
+                    storage.close_position(pos_id, 0, sig)
+                    symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
+                    logger.warning("[TX] Position #%d ($%s) expired (not found after %.0fs)", pos_id, symbol, age_seconds)
+                    await tg.send_trade_notification(
+                        f"TX EXPIRED ${symbol}\n"
+                        f"Transaction not confirmed after 90s. Position closed.\n"
+                        f"Sig: {sig[:20]}..."
+                    )
+                # else: still pending, wait more
+
+        except Exception:
+            logger.exception("[TX] Error in confirmation loop")
+
+
 # -- Entry point --
 
 async def main() -> None:
@@ -546,6 +610,7 @@ async def main() -> None:
     asyncio.create_task(_cleanup_loop())
     asyncio.create_task(_exit_monitor_loop())
     asyncio.create_task(_pnl_notification_loop())
+    asyncio.create_task(_tx_confirmation_loop())
 
     # Start new token discovery (RugCheck feed)
     listener = pool_listener.PoolListener(on_new_pool=_handle_new_pool)

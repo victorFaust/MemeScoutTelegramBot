@@ -288,6 +288,8 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
     if amount_sol is None:
         amount_sol = config.TRADE_AMOUNT_SOL
 
+    logger.info("[TRADE] Buy requested: token=%s amount_sol=%.6f", token_mint[:16], amount_sol)
+
     # Safety checks
     allowed, reason = can_trade()
     if not allowed:
@@ -330,24 +332,30 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
 
     # Record position
     out_amount = int(quote.get("outAmount", "0") or "0")
-    storage.record_position(
-        token_address=token_mint,
-        chain_id="solana",
-        buy_amount_sol=amount_sol,
-        token_amount=out_amount,
-        buy_signature=result["signature"],
-        entry_price_usd=entry_price_usd,
-        entry_mc=entry_mc,
-        token_symbol=token_symbol,
-    )
+    position_recorded = True
+    try:
+        storage.record_position(
+            token_address=token_mint,
+            chain_id="solana",
+            buy_amount_sol=amount_sol,
+            token_amount=out_amount,
+            buy_signature=result["signature"],
+            entry_price_usd=entry_price_usd,
+            entry_mc=entry_mc,
+            token_symbol=token_symbol,
+        )
+    except Exception:
+        position_recorded = False
+        logger.exception("[TRADE] Position record failed for %s (sig=%s)", token_mint[:16], result.get("signature", "")[:16])
 
     result["amount_sol"] = amount_sol
     result["token_mint"] = token_mint
     result["out_amount"] = out_amount
     result["price_impact_pct"] = price_impact
+    result["position_recorded"] = position_recorded
 
-    logger.info("[TRADE] Bought %s for %.3f SOL (impact=%.1f%%, sig=%s)",
-                token_mint[:16], amount_sol, price_impact, result["signature"][:16])
+    logger.info("[TRADE] Bought %s for %.3f SOL (impact=%.1f%%, sig=%s, position_recorded=%s)",
+                token_mint[:16], amount_sol, price_impact, result["signature"][:16], position_recorded)
     return result
 
 
@@ -450,3 +458,33 @@ def check_position_pnl(position: dict) -> dict | None:
         "pnl_sol": round(pnl_sol, 6),
         "pnl_pct": round(pnl_pct, 1),
     }
+
+
+def confirm_transaction(signature: str) -> str:
+    """Poll Solana RPC for transaction confirmation status.
+
+    Returns one of: 'confirmed', 'finalized', 'failed', 'not_found', 'error'.
+    """
+    rpc_url = config.QUICKNODE_HTTP_URL or "https://api.mainnet-beta.solana.com"
+    try:
+        resp = requests.post(rpc_url, json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [[signature], {"searchTransactionHistory": True}],
+        }, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        statuses = data.get("result", {}).get("value", [])
+        if not statuses or statuses[0] is None:
+            return "not_found"
+        status = statuses[0]
+        if status.get("err"):
+            return "failed"
+        commitment = status.get("confirmationStatus", "")
+        if commitment in ("finalized", "confirmed"):
+            return commitment
+        return "confirmed"
+    except Exception as e:
+        logger.warning("[TRADE] Tx confirmation check failed: %s", e)
+        return "error"
