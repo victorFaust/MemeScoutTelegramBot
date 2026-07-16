@@ -111,6 +111,11 @@ def run_snapshot_check() -> dict[str, int]:
             if _is_rugged(chain_id, pair_address):
                 logger.info("Token %s on %s appears rugged", row.get("token_symbol", "?"), chain_id)
                 storage.update_snapshot(row_id, "", None, rugged=True)
+                try:
+                    import feature_logger
+                    feature_logger.mark_rugged(row.get("token_address", ""), chain_id)
+                except Exception:
+                    pass
                 stats["rugged"] += 1
                 continue
 
@@ -132,6 +137,16 @@ def run_snapshot_check() -> dict[str, int]:
                 stats["updated"] += 1
                 logger.debug("Updated %s snapshot for %s: $%.8f",
                              window_name, row.get("token_symbol", "?"), current_price)
+
+            # Sync ML feature outcomes
+            try:
+                import feature_logger
+                token_addr = row.get("token_address", "")
+                for window_name in windows_due:
+                    feature_logger.update_outcome(token_addr, chain_id, window_name, current_price)
+                feature_logger.update_max_price(token_addr, chain_id, new_max)
+            except Exception:
+                pass  # non-critical
 
             # Small delay between API calls
             time.sleep(0.5)
