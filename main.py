@@ -13,6 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 import config
 import dexscreener_client as dex
 import filters
+import feature_logger
 import holder_analysis
 import performance_tracker
 import pool_listener
@@ -201,6 +202,15 @@ async def _run_chain_cycle(chain_id: str) -> None:
                 liquidity=(pair.get("liquidity") or {}).get("usd"),
                 market_cap=pair.get("marketCap") or pair.get("fdv"),
             )
+            # Log ML features for learning system
+            feature_logger.log_features(
+                token_address=addr,
+                chain_id=chain,
+                token_symbol=base.get("symbol", "?"),
+                score_result=result,
+                pair=pair,
+                safety_data=safety_data,
+            )
             sent += 1
 
             # Auto-buy if enabled (DexScreener momentum alerts)
@@ -307,6 +317,17 @@ async def _handle_new_pool(token_info: dict) -> None:
         logger.info("[POOL] Alert sent: $%s (%s) | %d txns",
                     token_info["symbol"], token_address[:16], total_txns)
 
+        # Log ML features for new pool alerts
+        pool_score_result = {"score": 0, "breakdown": {}}
+        feature_logger.log_features(
+            token_address=token_address,
+            chain_id=chain_id,
+            token_symbol=token_info.get("symbol", "?"),
+            score_result=pool_score_result,
+            pair=pair,
+            safety_data=rc_data,
+        )
+
         # Auto-buy if enabled
         if config.AUTO_BUY_NEW_POOLS and config.AUTO_BUY_ENABLED and config.TRADING_ENABLED:
             import executor
@@ -332,6 +353,10 @@ async def _snapshot_loop() -> None:
             stats = performance_tracker.run_snapshot_check()
             if stats.get("updated") or stats.get("rugged"):
                 logger.info("[SNAPSHOT] %s", stats)
+            # Label ML features periodically
+            labeled = feature_logger.label_outcomes()
+            if labeled:
+                logger.info("[ML] Labeled %d new outcomes", labeled)
         except Exception:
             logger.exception("[SNAPSHOT] Error in snapshot tracker")
 

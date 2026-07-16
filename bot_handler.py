@@ -1068,6 +1068,22 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
     if bracket_lines:
         lines += ["", "📊 BY SCORE"] + bracket_lines
 
+    # ML training data stats
+    try:
+        import feature_logger
+        ml = feature_logger.get_feature_stats()
+        labeled = ml['labeled']
+        remaining = 200 - labeled
+        ready_msg = '✅ Ready for training!' if ml['ready_for_training'] else f'Need {remaining} more labeled samples'
+        lines += [
+            "",
+            f"🧠 ML DATA: {labeled}/{ml['total']} labeled",
+            f"  🌙 moon: {ml['moons']} | 🚀 pump: {ml['pumps']} | ⚪ neutral: {ml['neutrals']} | 📉 dump: {ml['dumps']} | 🚩 rug: {ml['rugs']}",
+            f"  {ready_msg}",
+        ]
+    except Exception:
+        pass
+
     lines += ["", "━━━━━━━━━━━━━━━━━━", f"Use /report <days> for custom range"]
 
     await update.message.reply_text("\n".join(lines))
