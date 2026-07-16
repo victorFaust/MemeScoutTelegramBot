@@ -214,27 +214,6 @@ async def _run_chain_cycle(chain_id: str) -> None:
             )
             sent += 1
 
-            # Auto-buy if enabled (DexScreener momentum alerts)
-            if config.AUTO_BUY_ENABLED and config.TRADING_ENABLED:
-                import executor
-                amount_sol = executor.usd_to_sol(config.AUTO_BUY_AMOUNT_USD)
-                allowed, reason = executor.can_trade()
-                if allowed:
-                    buy_result = await asyncio.to_thread(executor.buy_token, addr, amount_sol)
-                    if buy_result:
-                        sol_price = executor.get_sol_price()
-                        await tg.send_trade_notification(
-                            f"AUTO-BUY: ${config.AUTO_BUY_AMOUNT_USD:.0f} ({amount_sol:.3f} SOL) | "
-                            f"impact: {buy_result.get('price_impact_pct', 0):.1f}%",
-                            addr
-                        )
-                        logger.info("[AUTO] Bought %s for $%.0f (%.3f SOL)",
-                                    base.get("symbol", "?"), config.AUTO_BUY_AMOUNT_USD, amount_sol)
-                    else:
-                        logger.warning("[AUTO] Buy failed for %s", addr[:16])
-                else:
-                    logger.info("[AUTO] Buy skipped for %s: %s", addr[:16], reason)
-
     _chain_last_run[chain_id] = time.time()
     logger.info("[%s] Cycle done -- %d alerts sent", chain_id, sent)
 
@@ -328,20 +307,6 @@ async def _handle_new_pool(token_info: dict) -> None:
             pair=pair,
             safety_data=rc_data,
         )
-
-        # Auto-buy if enabled
-        if config.AUTO_BUY_NEW_POOLS and config.AUTO_BUY_ENABLED and config.TRADING_ENABLED:
-            import executor
-            amount_sol = executor.usd_to_sol(config.AUTO_BUY_AMOUNT_USD)
-            allowed, reason = executor.can_trade()
-            if allowed:
-                buy_result = await asyncio.to_thread(executor.buy_token, token_address, amount_sol)
-                if buy_result:
-                    await tg.send_trade_notification(
-                        f"AUTO-BUY: ${config.AUTO_BUY_AMOUNT_USD:.0f} ({amount_sol:.3f} SOL) | "
-                        f"${token_info['symbol']}",
-                        token_address
-                    )
 
 
 # -- Smart Wallet Copy-Trade Handler --
