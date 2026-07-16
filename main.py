@@ -23,6 +23,7 @@ import safety_check
 import startup_check
 import storage
 import telegram_notifier as tg
+import wallet_tracker
 
 
 def _setup_logging() -> None:
@@ -343,6 +344,146 @@ async def _handle_new_pool(token_info: dict) -> None:
                     )
 
 
+# -- Smart Wallet Copy-Trade Handler --
+
+async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence: int, signature: str) -> None:
+    """Handle a new buy detected from a tracked smart wallet.
+
+    Flow:
+    1. Check confidence (how many tracked wallets bought this)
+    2. Fetch token data from DexScreener
+    3. Run safety checks (RugCheck + GoPlus + holder analysis)
+    4. Send alert with wallet info
+    5. Auto-buy if enabled and confidence >= 2 (or if single high-WR wallet)
+    """
+    chain_id = "solana"
+
+    # Skip if already alerted by normal flow
+    if storage.was_recently_alerted(chain_id, token_address):
+        logger.debug("[WALLET] %s already alerted, skipping", token_address[:16])
+        return
+
+    # Fetch pair data from DexScreener
+    pairs = await asyncio.to_thread(dex.fetch_pair_details, chain_id, token_address)
+    if not pairs:
+        logger.debug("[WALLET] %s not on DexScreener yet", token_address[:16])
+        return
+
+    pair = pairs[0]
+    base = pair.get("baseToken", {})
+    symbol = base.get("symbol", "???")
+    mc = pair.get("marketCap") or pair.get("fdv") or 0
+    liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
+    price = float(pair.get("priceUsd", 0) or 0)
+
+    # Basic sanity: skip if MC > $5M or liq < $1K (too big or too illiquid)
+    if mc > 5_000_000:
+        logger.debug("[WALLET] $%s MC too high ($%.0fK), skipping", symbol, mc / 1000)
+        return
+    if liq < 1000:
+        logger.debug("[WALLET] $%s liq too low ($%.0f), skipping", symbol, liq)
+        return
+
+    # Safety checks
+    cfg = config.get_chain_profile(chain_id)
+    rc_pass, rc_data = await asyncio.to_thread(rugcheck.evaluate_rugcheck, token_address, chain_id)
+    if not rc_pass:
+        logger.info("[WALLET] $%s failed RugCheck, skipping", symbol)
+        return
+
+    # Holder analysis
+    holder_pass, holder_data = await asyncio.to_thread(
+        holder_analysis.passes_holder_checks, token_address, cfg
+    )
+
+    # Merge safety data
+    safety_data = rc_data or {}
+    if holder_data:
+        safety_data.update(holder_data)
+
+    # Get wallet info for the alert
+    wallets = wallet_tracker.get_tracked_wallets()
+    wallet_info = next((w for w in wallets if w["address"] == wallet_address), {})
+    wallet_label = wallet_info.get("label") or wallet_address[:12]
+    wallet_wr = wallet_info.get("win_rate", 0)
+
+    def _mc(v):
+        return f"${v/1000:.0f}K" if v >= 1000 else f"${v:.0f}"
+
+    # Build alert message
+    conf_emoji = "🔥" * min(confidence, 5)
+    alert_text = (
+        f"🐋 SMART MONEY BUY\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Token: ${symbol}\n"
+        f"MC: {_mc(mc)} | Liq: {_mc(liq)}\n"
+        f"Price: ${price:.8f}\n"
+        f"\n"
+        f"👛 Wallet: {wallet_label}\n"
+        f"Win Rate: {wallet_wr:.0f}%\n"
+        f"Confidence: {confidence} wallet(s) {conf_emoji}\n"
+    )
+
+    if safety_data:
+        rc_score = safety_data.get("rugcheck_score")
+        lp_lock = safety_data.get("lp_locked_pct", 0)
+        if rc_score is not None:
+            alert_text += f"\nRugCheck: {rc_score:.0f}/100 | LP Lock: {lp_lock:.0f}%"
+
+    alert_text += f"\n━━━━━━━━━━━━━━━━━━\nTx: solscan.io/tx/{signature[:32]}..."
+
+    # Send alert via Telegram
+    ok = await tg.send_trade_notification(alert_text, token_address)
+    if ok:
+        storage.record_alert(chain_id, token_address, 0)
+        storage.record_outcome(
+            token_address=token_address,
+            chain_id=chain_id,
+            pair_address=pair.get("pairAddress", ""),
+            token_symbol=symbol,
+            score=0,
+            price=price,
+            liquidity=liq,
+            market_cap=mc,
+        )
+
+    # Auto-buy decision
+    should_buy = (
+        config.AUTO_BUY_ENABLED
+        and config.TRADING_ENABLED
+        and (confidence >= 2 or wallet_wr >= 65)  # 2+ wallets OR single high-WR wallet
+        and holder_pass  # Must pass holder checks
+    )
+
+    if should_buy:
+        import executor
+        # Scale buy amount by confidence
+        base_amount = config.AUTO_BUY_AMOUNT_USD
+        if confidence >= 3:
+            buy_usd = base_amount * 2  # Double size for 3+ wallets
+        elif confidence >= 2:
+            buy_usd = base_amount * 1.5
+        else:
+            buy_usd = base_amount
+
+        amount_sol = executor.usd_to_sol(buy_usd)
+        allowed, reason = executor.can_trade()
+        if allowed:
+            buy_result = await asyncio.to_thread(executor.buy_token, token_address, amount_sol)
+            if buy_result:
+                await tg.send_trade_notification(
+                    f"🐋 COPY-BUY: ${buy_usd:.0f} ({amount_sol:.3f} SOL) | ${symbol}\n"
+                    f"Following: {wallet_label} (WR {wallet_wr:.0f}%)\n"
+                    f"Confidence: {confidence} wallet(s)",
+                    token_address
+                )
+                logger.info("[WALLET] Copy-bought $%s for $%.0f (confidence=%d)", symbol, buy_usd, confidence)
+            else:
+                logger.warning("[WALLET] Copy-buy failed for $%s", symbol)
+        else:
+            logger.info("[WALLET] Copy-buy skipped for $%s: %s", symbol, reason)
+
+
 # -- Background tasks (independent of per-chain scheduling) --
 
 async def _snapshot_loop() -> None:
@@ -640,6 +781,9 @@ async def main() -> None:
     # Start new token discovery (RugCheck feed)
     listener = pool_listener.PoolListener(on_new_pool=_handle_new_pool)
     asyncio.create_task(listener.start())
+
+    # Start smart wallet tracker (copy-trading)
+    asyncio.create_task(wallet_tracker.poll_tracked_wallets(_handle_wallet_buy))
 
     # Start Telegram bot handler (for buy buttons + commands)
     asyncio.create_task(bot_handler.start_bot_handler())
