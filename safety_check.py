@@ -40,7 +40,10 @@ def _fetch_goplus_solana(token_address: str) -> dict | None:
         resp = requests.get(url, params={"contract_addresses": token_address}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        result = data.get("result", {})
+        result = data.get("result")
+        if not isinstance(result, dict):
+            logger.warning("GoPlus returned non-dict result for %s: %s", token_address[:16], type(result))
+            return None
         # GoPlus returns results keyed by address
         return result.get(token_address) or result.get(token_address.lower()) or {}
     except requests.RequestException as e:
