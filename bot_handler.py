@@ -1159,6 +1159,89 @@ async def _handle_watch_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(f"Added ${symbol} to watchlist\nMC: {_mc(mc)}\nUse /start -> Watchlist to view")
 
 
+# -- Wallet Tracker Commands --
+
+async def _handle_addwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /addwallet <address> [label] [win_rate]."""
+    if not update.message:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /addwallet <address> [label] [win_rate%]\nExample: /addwallet 7xKp...abc WhaleKing 72")
+        return
+
+    import wallet_tracker
+
+    address = args[0]
+    if len(address) < 32 or len(address) > 44:
+        await update.message.reply_text("Invalid Solana address")
+        return
+
+    label = args[1] if len(args) > 1 else ""
+    win_rate = 0.0
+    if len(args) > 2:
+        try:
+            win_rate = float(args[2])
+        except ValueError:
+            pass
+
+    wallet_tracker.add_wallet(address, label, win_rate)
+    count = wallet_tracker.get_wallet_count()
+    await update.message.reply_text(
+        f"Added wallet to tracker:\n"
+        f"Address: {address[:12]}...{address[-6:]}\n"
+        f"Label: {label or 'None'}\n"
+        f"Win Rate: {win_rate:.0f}%\n"
+        f"\nTotal tracked: {count}"
+    )
+
+
+async def _handle_wallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /wallets — show all tracked wallets."""
+    if not update.message:
+        return
+
+    import wallet_tracker
+
+    wallets = wallet_tracker.get_tracked_wallets()
+    if not wallets:
+        await update.message.reply_text(
+            "No wallets tracked.\n\nUse /addwallet <address> [label] [win_rate%] to add.\n"
+            "Find alpha wallets at gmgn.ai/sol/leaderboard"
+        )
+        return
+
+    lines = ["🐋 TRACKED WALLETS\n━━━━━━━━━━━━━━━━━━\n"]
+    for w in wallets:
+        addr = w["address"]
+        label = w.get("label") or "—"
+        wr = w.get("win_rate", 0) or 0
+        trades = w.get("total_trades", 0)
+        lines.append(f"  {label} ({addr[:8]}...{addr[-4:]})")
+        lines.append(f"    WR: {wr:.0f}% | Trades: {trades}")
+
+    lines.append(f"\n━━━━━━━━━━━━━━━━━━\nTotal: {len(wallets)} wallets")
+    lines.append("Use /rmwallet <address> to remove")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _handle_rmwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /rmwallet <address>."""
+    if not update.message:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /rmwallet <address>")
+        return
+
+    import wallet_tracker
+
+    address = args[0]
+    wallet_tracker.remove_wallet(address)
+    await update.message.reply_text(f"Removed: {address[:12]}...")
+
+
 # -- Start Bot --
 
 async def start_bot_handler() -> None:
@@ -1179,6 +1262,8 @@ async def start_bot_handler() -> None:
         BotCommand("buy", "Buy token: /buy <address> $5"),
         BotCommand("sell", "Sell: /sell <id> or /sell all"),
         BotCommand("watch", "Watch token: /watch <address>"),
+        BotCommand("wallets", "View tracked wallets"),
+        BotCommand("addwallet", "Track wallet: /addwallet <addr> [label] [wr%]"),
         BotCommand("autobuy", "Toggle auto-buy"),
         BotCommand("stop", "Emergency stop all trading"),
     ])
@@ -1193,6 +1278,9 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("buy", _handle_buy_command))
     app.add_handler(CommandHandler("sell", _handle_sell_command))
     app.add_handler(CommandHandler("watch", _handle_watch_command))
+    app.add_handler(CommandHandler("addwallet", _handle_addwallet_command))
+    app.add_handler(CommandHandler("wallets", _handle_wallets_command))
+    app.add_handler(CommandHandler("rmwallet", _handle_rmwallet_command))
     app.add_handler(CommandHandler("autobuy", lambda u, c: u.message.reply_text(
         f"Auto-buy: {'ON -> OFF' if config.AUTO_BUY_ENABLED else 'OFF -> ON'}",
     ) if (setattr(config, 'AUTO_BUY_ENABLED', not config.AUTO_BUY_ENABLED) or True) else None))

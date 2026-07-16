@@ -45,6 +45,10 @@ QUICKNODE_HTTP_URL: str = os.getenv("QUICKNODE_HTTP_URL", "")
 # Shyft Solana
 SHYFT_HTTP_URL: str = os.getenv("SHYFT_HTTP_URL", "")
 
+# Helius API
+HELIUS_API_KEY: str = os.getenv("HELIUS_API_KEY", "")
+HELIUS_RPC_URL: str = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+
 # Trading (Jupiter swap)
 TRADING_WALLET_PRIVATE_KEY: str = os.getenv("TRADING_WALLET_PRIVATE_KEY", "")
 TRADE_AMOUNT_SOL: float = _float("TRADE_AMOUNT_SOL", 0.1)
