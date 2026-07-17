@@ -420,7 +420,7 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
     should_buy = (
         config.AUTO_BUY_ENABLED
         and config.TRADING_ENABLED
-        and (confidence >= 2 or wallet_wr >= 50)  # 2+ wallets OR single wallet with 50%+ WR
+        and (confidence >= 2 or wallet_wr >= 70)  # 2+ wallets OR single wallet with 70%+ WR
     )
     # Holder check is advisory for copy-trades (log but don't block)
     if not holder_pass:

@@ -1,4 +1,4 @@
-"""Smart Money Wallet Tracker -- copy-trade proven winners.
+﻿"""Smart Money Wallet Tracker -- copy-trade proven winners.
 
 Monitors a curated list of high-win-rate wallets via Helius API.
 When a tracked wallet buys a new token:
@@ -406,7 +406,7 @@ def _score_wallet(wallet_address: str) -> dict | None:
     if len(swaps) < 5:
         return None  # Too few trades to evaluate
 
-    # Track buy→sell pairs per token
+    # Track buyâ†’sell pairs per token
     buys = {}  # token -> list of buy timestamps
     sells = {}  # token -> list of sell timestamps
 
@@ -550,7 +550,7 @@ def discover_alpha_wallets() -> list[dict]:
         total = stats["total_trades"]
 
         # Qualify: >50% win rate and appeared in 2+ winners
-        if win_rate >= 50 and total >= 3:
+        if win_rate >= 70 and total >= 3:
             label = f"Auto-{len(tokens)}wins"
             add_wallet(addr, label, win_rate)
 
@@ -604,7 +604,7 @@ def prune_underperforming_wallets(min_win_rate: float = 40, min_trades: int = 3)
         new_wr = None
 
         if stats is None:
-            # Can't evaluate — might be inactive. Only prune if wallet is old (>7 days)
+            # Can't evaluate â€” might be inactive. Only prune if wallet is old (>7 days)
             age_days = (time.time() - wallet.get("added_at", time.time())) / 86400
             if age_days > 7:
                 reason = "inactive (no recent trades)"
@@ -715,7 +715,7 @@ def discover_from_trending() -> list[dict]:
         if addr:
             winning_tokens.append(addr)
 
-    # From search — pick tokens with strong recent gains
+    # From search â€” pick tokens with strong recent gains
     for pair in search_pairs[:50]:
         if (pair.get("chainId") or "").lower() != "solana":
             continue
@@ -788,7 +788,7 @@ def discover_from_trending() -> list[dict]:
         win_rate = stats["win_rate"]
         total = stats["total_trades"]
 
-        if win_rate >= 50 and total >= 3:
+        if win_rate >= 70 and total >= 3:
             label = f"Trend-{len(tokens)}hits"
             add_wallet(addr, label, win_rate)
 
