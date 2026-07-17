@@ -323,15 +323,17 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
     """
     chain_id = "solana"
 
+    logger.info("[WALLET] Processing buy: wallet=%s token=%s confidence=%d", wallet_address[:12], token_address[:16], confidence)
+
     # Skip if already alerted by normal flow
     if storage.was_recently_alerted(chain_id, token_address):
-        logger.debug("[WALLET] %s already alerted, skipping", token_address[:16])
+        logger.info("[WALLET] %s already alerted recently, skipping", token_address[:16])
         return
 
     # Fetch pair data from DexScreener
     pairs = await asyncio.to_thread(dex.fetch_pair_details, chain_id, token_address)
     if not pairs:
-        logger.debug("[WALLET] %s not on DexScreener yet", token_address[:16])
+        logger.info("[WALLET] %s not on DexScreener yet, skipping", token_address[:16])
         return
 
     pair = pairs[0]
@@ -341,12 +343,14 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
     liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
     price = float(pair.get("priceUsd", 0) or 0)
 
+    logger.info("[WALLET] $%s: MC=$%.0fK, Liq=$%.0fK, Price=$%.8f", symbol, mc/1000, liq/1000, price)
+
     # Basic sanity: skip if MC > $5M or liq < $1K (too big or too illiquid)
     if mc > 5_000_000:
-        logger.debug("[WALLET] $%s MC too high ($%.0fK), skipping", symbol, mc / 1000)
+        logger.info("[WALLET] $%s MC too high ($%.0fK), skipping", symbol, mc / 1000)
         return
     if liq < 1000:
-        logger.debug("[WALLET] $%s liq too low ($%.0f), skipping", symbol, liq)
+        logger.info("[WALLET] $%s liq too low ($%.0f), skipping", symbol, liq)
         return
 
     # Safety checks
@@ -419,6 +423,19 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
         and (confidence >= 2 or wallet_wr >= 65)  # 2+ wallets OR single high-WR wallet
         and holder_pass  # Must pass holder checks
     )
+
+    if not should_buy:
+        reasons = []
+        if not config.AUTO_BUY_ENABLED:
+            reasons.append("AUTO_BUY_ENABLED=false")
+        if not config.TRADING_ENABLED:
+            reasons.append("TRADING_ENABLED=false")
+        if not (confidence >= 2 or wallet_wr >= 65):
+            reasons.append(f"low confidence ({confidence}) and WR ({wallet_wr:.0f}%)")
+        if not holder_pass:
+            reasons.append("failed holder checks")
+        logger.info("[WALLET] $%s auto-buy skipped: %s", symbol, ", ".join(reasons))
+        return
 
     if should_buy:
         import executor
