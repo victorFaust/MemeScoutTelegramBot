@@ -420,9 +420,11 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
     should_buy = (
         config.AUTO_BUY_ENABLED
         and config.TRADING_ENABLED
-        and (confidence >= 2 or wallet_wr >= 65)  # 2+ wallets OR single high-WR wallet
-        and holder_pass  # Must pass holder checks
+        and (confidence >= 2 or wallet_wr >= 50)  # 2+ wallets OR single wallet with 50%+ WR
     )
+    # Holder check is advisory for copy-trades (log but don't block)
+    if not holder_pass:
+        logger.info("[WALLET] $%s holder analysis failed -- proceeding anyway (copy-trade)", symbol)
 
     if not should_buy:
         reasons = []
@@ -430,10 +432,8 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
             reasons.append("AUTO_BUY_ENABLED=false")
         if not config.TRADING_ENABLED:
             reasons.append("TRADING_ENABLED=false")
-        if not (confidence >= 2 or wallet_wr >= 65):
+        if not (confidence >= 2 or wallet_wr >= 50):
             reasons.append(f"low confidence ({confidence}) and WR ({wallet_wr:.0f}%)")
-        if not holder_pass:
-            reasons.append("failed holder checks")
         logger.info("[WALLET] $%s auto-buy skipped: %s", symbol, ", ".join(reasons))
         return
 
@@ -449,6 +449,7 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
             buy_usd = base_amount
 
         amount_sol = executor.usd_to_sol(buy_usd)
+        logger.info("[WALLET] Attempting copy-buy: $%s for $%.0f (%.4f SOL), confidence=%d", symbol, buy_usd, amount_sol, confidence)
         allowed, reason = executor.can_trade()
         if allowed:
             buy_result = await asyncio.to_thread(executor.buy_token, token_address, amount_sol)
