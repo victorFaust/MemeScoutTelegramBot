@@ -134,12 +134,12 @@ def was_buy_already_seen(wallet: str, token: str) -> bool:
 
 
 def get_wallet_buy_count_recent(wallet: str, minutes: int = 60) -> int:
-    """Count how many buys a wallet made in the last N minutes."""
+    """Count how many distinct tokens a wallet bought in the last N minutes."""
     conn = _connect()
     try:
         cutoff = time.time() - (minutes * 60)
         row = conn.execute(
-            "SELECT COUNT(*) FROM wallet_buys WHERE wallet_address = ? AND detected_at > ?",
+            "SELECT COUNT(DISTINCT token_address) FROM wallet_buys WHERE wallet_address = ? AND detected_at > ?",
             (wallet, cutoff),
         ).fetchone()
         return row[0] if row else 0
@@ -148,12 +148,12 @@ def get_wallet_buy_count_recent(wallet: str, minutes: int = 60) -> int:
 
 
 def get_total_copy_buys_recent(minutes: int = 60) -> int:
-    """Count total copy-buys across all wallets in the last N minutes."""
+    """Count total distinct tokens copy-bought across all wallets in the last N minutes."""
     conn = _connect()
     try:
         cutoff = time.time() - (minutes * 60)
         row = conn.execute(
-            "SELECT COUNT(*) FROM wallet_buys WHERE acted_on = 1 AND detected_at > ?",
+            "SELECT COUNT(DISTINCT token_address) FROM wallet_buys WHERE acted_on = 1 AND detected_at > ?",
             (cutoff,),
         ).fetchone()
         return row[0] if row else 0
