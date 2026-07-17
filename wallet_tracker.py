@@ -573,3 +573,83 @@ def discover_alpha_wallets() -> list[dict]:
 
     logger.info("[DISCOVERY] Discovery complete: %d new wallets added", len(newly_added))
     return newly_added
+
+
+# -- Auto-Prune: drop wallets whose performance decayed --
+
+def prune_underperforming_wallets(min_win_rate: float = 40, min_trades: int = 3) -> list[dict]:
+    """Re-evaluate all tracked wallets and deactivate those with degraded stats.
+
+    A wallet is dropped if:
+    - Win rate dropped below min_win_rate (default 40%)
+    - OR avg return is negative
+    - OR too few recent trades to evaluate (went inactive)
+
+    Returns list of pruned wallets with reasons.
+    """
+    wallets = get_tracked_wallets()
+    if not wallets:
+        return []
+
+    pruned = []
+
+    for wallet in wallets:
+        addr = wallet["address"]
+        label = wallet.get("label") or addr[:12]
+        old_wr = wallet.get("win_rate", 0) or 0
+
+        stats = _score_wallet(addr)
+
+        reason = None
+        new_wr = None
+
+        if stats is None:
+            # Can't evaluate — might be inactive. Only prune if wallet is old (>7 days)
+            age_days = (time.time() - wallet.get("added_at", time.time())) / 86400
+            if age_days > 7:
+                reason = "inactive (no recent trades)"
+        else:
+            new_wr = stats["win_rate"]
+            avg_ret = stats["avg_return"]
+            total = stats["total_trades"]
+
+            # Update stored stats regardless
+            _update_wallet_stats(addr, new_wr, total, stats["winning_trades"], avg_ret)
+
+            if new_wr < min_win_rate and total >= min_trades:
+                reason = f"win rate dropped to {new_wr:.0f}% (was {old_wr:.0f}%)"
+            elif avg_ret < -15 and total >= min_trades:
+                reason = f"avg return {avg_ret:+.1f}% (negative)"
+
+        if reason:
+            remove_wallet(addr)
+            pruned.append({
+                "address": addr,
+                "label": label,
+                "old_win_rate": old_wr,
+                "new_win_rate": new_wr,
+                "reason": reason,
+            })
+            logger.info("[PRUNE] Dropped wallet %s (%s): %s", addr[:12], label, reason)
+
+        time.sleep(1)  # Rate limit
+
+    logger.info("[PRUNE] Pruned %d/%d wallets", len(pruned), len(wallets))
+    return pruned
+
+
+def _update_wallet_stats(address: str, win_rate: float, total_trades: int,
+                         winning_trades: int, avg_return: float) -> None:
+    """Update a wallet's performance stats in DB."""
+    conn = _connect()
+    try:
+        conn.execute(
+            """UPDATE tracked_wallets
+               SET win_rate = ?, total_trades = ?, winning_trades = ?,
+                   avg_return_pct = ?, last_checked = ?
+               WHERE address = ?""",
+            (win_rate, total_trades, winning_trades, avg_return, time.time(), address),
+        )
+        conn.commit()
+    finally:
+        conn.close()

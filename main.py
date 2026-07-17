@@ -672,6 +672,28 @@ async def _wallet_discovery_loop() -> None:
             else:
                 logger.info("[DISCOVERY] No new wallets found this cycle")
 
+            # Prune underperforming wallets
+            pruned = await asyncio.to_thread(wallet_tracker.prune_underperforming_wallets)
+            if pruned:
+                total_tracked = wallet_tracker.get_wallet_count()
+                for w in pruned:
+                    addr = w["address"]
+                    short_addr = f"{addr[:8]}...{addr[-6:]}"
+                    old_wr = w.get("old_win_rate", 0)
+                    new_wr = w.get("new_win_rate")
+                    wr_str = f"{new_wr:.0f}%" if new_wr is not None else "N/A"
+
+                    alert_text = (
+                        f"🚫 WALLET DROPPED\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"👛 {w.get('label', short_addr)}\n"
+                        f"📉 Win Rate: {old_wr:.0f}% → {wr_str}\n"
+                        f"❌ Reason: {w['reason']}\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"Remaining tracked: {total_tracked}"
+                    )
+                    await tg.send_trade_notification(alert_text)
+
         except Exception:
             logger.exception("[DISCOVERY] Error in discovery loop")
 
