@@ -591,7 +591,7 @@ def discover_alpha_wallets() -> list[dict]:
         total = stats["total_trades"]
 
         # Qualify: >50% win rate and appeared in 2+ winners
-        if win_rate >= 70 and total >= 3:
+        if win_rate >= 60 and total >= 10:
             label = f"Auto-{len(tokens)}wins"
             add_wallet(addr, label, win_rate)
 
@@ -829,7 +829,7 @@ def discover_from_trending() -> list[dict]:
         win_rate = stats["win_rate"]
         total = stats["total_trades"]
 
-        if win_rate >= 70 and total >= 3:
+        if win_rate >= 60 and total >= 10:
             label = f"Trend-{len(tokens)}hits"
             add_wallet(addr, label, win_rate)
 

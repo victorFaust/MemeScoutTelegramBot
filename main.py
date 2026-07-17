@@ -345,6 +345,28 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
 
     logger.info("[WALLET] $%s: MC=$%.0fK, Liq=$%.0fK, Price=$%.8f", symbol, mc/1000, liq/1000, price)
 
+    # Momentum check: only proceed if token is showing positive price action
+    pc = pair.get("priceChange") or {}
+    change_5m = pc.get("m5", 0) or 0
+    change_1h = pc.get("h1", 0) or 0
+    txns = (pair.get("txns") or {}).get("h1") or {}
+    buys_1h = txns.get("buys", 0) or 0
+    sells_1h = txns.get("sells", 0) or 0
+
+    has_momentum = (
+        change_5m > 0           # price going up in last 5 min
+        or change_1h > 5        # or up 5%+ in last hour
+        or buys_1h > sells_1h   # or more buys than sells
+    )
+
+    if not has_momentum:
+        logger.info("[WALLET] $%s no momentum (5m=%.1f%%, 1h=%.1f%%, buys=%d sells=%d), skipping alert",
+                    symbol, change_5m, change_1h, buys_1h, sells_1h)
+        return
+
+    logger.info("[WALLET] $%s has momentum: 5m=%+.1f%%, 1h=%+.1f%%, buys=%d sells=%d",
+                symbol, change_5m, change_1h, buys_1h, sells_1h)
+
     # Basic sanity: skip if MC > $5M or liq < $1K (too big or too illiquid)
     if mc > 5_000_000:
         logger.info("[WALLET] $%s MC too high ($%.0fK), skipping", symbol, mc / 1000)
@@ -437,7 +459,7 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
     should_buy = (
         config.AUTO_BUY_ENABLED
         and config.TRADING_ENABLED
-        and (confidence >= 2 or wallet_wr >= 70)  # 2+ wallets OR single wallet with 70%+ WR
+        and (confidence >= 2 or wallet_wr >= 60)  # 2+ wallets OR single wallet with 60%+ WR
     )
     # Holder check is advisory for copy-trades (log but don't block)
     if not holder_pass:
