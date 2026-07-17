@@ -1242,6 +1242,25 @@ async def _handle_rmwallet_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(f"Removed: {address[:12]}...")
 
 
+async def _handle_clearwallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /clearwallets — remove all tracked wallets."""
+    if not update.message:
+        return
+
+    import wallet_tracker
+
+    wallets = wallet_tracker.get_tracked_wallets()
+    if not wallets:
+        await update.message.reply_text("No wallets to clear.")
+        return
+
+    count = len(wallets)
+    for w in wallets:
+        wallet_tracker.remove_wallet(w["address"])
+
+    await update.message.reply_text(f"Cleared {count} tracked wallet(s).\nDiscovery will find new ones in the next cycle.")
+
+
 async def _handle_discover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /discover — manually trigger wallet discovery now."""
     if not update.message:
@@ -1318,6 +1337,7 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("addwallet", _handle_addwallet_command))
     app.add_handler(CommandHandler("wallets", _handle_wallets_command))
     app.add_handler(CommandHandler("rmwallet", _handle_rmwallet_command))
+    app.add_handler(CommandHandler("clearwallets", _handle_clearwallets_command))
     app.add_handler(CommandHandler("autobuy", lambda u, c: u.message.reply_text(
         f"Auto-buy: {'ON -> OFF' if config.AUTO_BUY_ENABLED else 'OFF -> ON'}",
     ) if (setattr(config, 'AUTO_BUY_ENABLED', not config.AUTO_BUY_ENABLED) or True) else None))
