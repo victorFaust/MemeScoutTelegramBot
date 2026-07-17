@@ -518,6 +518,11 @@ async def _exit_monitor_loop() -> None:
 
         for pos in positions:
             try:
+                # Skip positions bought less than 60s ago (let price stabilize after entry)
+                pos_age = time.time() - pos.get("bought_at", 0)
+                if pos_age < 60:
+                    continue
+
                 pnl = await asyncio.to_thread(executor.check_position_pnl, pos)
                 if pnl is None:
                     continue
@@ -778,14 +783,15 @@ async def _tx_confirmation_loop() -> None:
                         f"Sig: {sig[:20]}..."
                     )
                 elif age_seconds > 90 and status == "not_found":
-                    storage.update_tx_status(pos_id, "expired")
-                    storage.close_position(pos_id, 0, sig)
+                    # Don't close position — tx may have succeeded but RPC can't find it
+                    # The tokens are in the wallet, so keep the position open
+                    storage.update_tx_status(pos_id, "unconfirmed")
                     symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
-                    logger.warning("[TX] Position #%d ($%s) expired (not found after %.0fs)", pos_id, symbol, age_seconds)
+                    logger.warning("[TX] Position #%d ($%s) unconfirmed after %.0fs (keeping open)", pos_id, symbol, age_seconds)
                     await tg.send_trade_notification(
-                        f"TX EXPIRED ${symbol}\n"
-                        f"Transaction not confirmed after 90s. Position closed.\n"
-                        f"Sig: {sig[:20]}..."
+                        f"⚠️ TX UNCONFIRMED ${symbol}\n"
+                        f"Could not confirm after 90s but position kept open.\n"
+                        f"Check: solscan.io/tx/{sig}"
                     )
                 # else: still pending, wait more
 
