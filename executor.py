@@ -2,6 +2,7 @@
 
 Handles quoting, transaction building, signing, and submission.
 Safety rails: max position size, max open positions, daily loss limit.
+Supports Jito bundles for MEV protection and dynamic slippage.
 """
 
 import base64
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
+JITO_BUNDLE_URL = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
+JITO_TIP_LAMPORTS = 10_000  # 0.00001 SOL tip to Jito validator
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
@@ -120,22 +123,159 @@ def get_wallet_address() -> str | None:
     return str(kp.pubkey())
 
 
+def _dynamic_slippage(token_mint: str, amount_sol: float) -> int:
+    """Calculate slippage BPS based on token liquidity and trade size.
+
+    Low liquidity or large relative trade size → higher slippage.
+    Returns slippage in basis points (100 = 1%).
+    """
+    import dexscreener_client as dex
+
+    base_slippage = config.TRADE_SLIPPAGE_BPS  # default from config
+
+    try:
+        pairs = dex.fetch_pair_details("solana", token_mint)
+        if not pairs:
+            return base_slippage
+
+        liq = (pairs[0].get("liquidity") or {}).get("usd", 0) or 0
+        if liq <= 0:
+            return base_slippage
+
+        sol_price = get_sol_price()
+        trade_usd = amount_sol * sol_price
+        trade_pct_of_liq = (trade_usd / liq) * 100 if liq > 0 else 100
+
+        # Scale slippage based on trade size relative to liquidity
+        if trade_pct_of_liq > 5:
+            # Trade is >5% of liquidity — high impact, need more slippage
+            slippage = min(base_slippage * 2, 1500)  # cap at 15%
+        elif trade_pct_of_liq > 2:
+            slippage = int(base_slippage * 1.5)
+        elif liq < 5000:
+            # Very thin liquidity
+            slippage = min(base_slippage + 200, 1500)
+        else:
+            slippage = base_slippage
+
+        logger.debug("[TRADE] Dynamic slippage: %d bps (liq=$%.0f, trade=$%.0f, %.1f%% of pool)",
+                     slippage, liq, trade_usd, trade_pct_of_liq)
+        return slippage
+
+    except Exception:
+        return base_slippage
+
+
+def _get_sell_quote_with_slippage(token_mint: str, token_amount: int, slippage_bps: int) -> dict | None:
+    """Get a sell quote with specific slippage."""
+    try:
+        resp = requests.get(JUPITER_QUOTE_URL, params={
+            "inputMint": token_mint,
+            "outputMint": SOL_MINT,
+            "amount": str(token_amount),
+            "slippageBps": slippage_bps,
+            "onlyDirectRoutes": "false",
+        }, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            logger.error("[TRADE] Jupiter sell quote error: %s", data["error"])
+            return None
+        return data
+    except requests.RequestException as e:
+        logger.error("[TRADE] Jupiter sell quote request failed: %s", e)
+        return None
+
+
+def _submit_jito_bundle(signed_tx_b64: str) -> dict | None:
+    """Submit a transaction as a Jito bundle for MEV protection.
+
+    Returns {"signature": str, "status": str} on success, None on failure.
+    """
+    try:
+        resp = requests.post(JITO_BUNDLE_URL, json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [[signed_tx_b64]],
+        }, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+
+        if "error" in result:
+            logger.warning("[TRADE] Jito bundle error: %s", result["error"])
+            return None
+
+        bundle_id = result.get("result", "")
+        if bundle_id:
+            logger.info("[TRADE] Jito bundle submitted: %s", bundle_id)
+            # Extract signature from the signed transaction
+            try:
+                from solders.transaction import VersionedTransaction  # type: ignore
+                tx_bytes = base64.b64decode(signed_tx_b64)
+                tx = VersionedTransaction.from_bytes(tx_bytes)
+                sig = str(tx.signatures[0])
+                return {"signature": sig, "status": "jito_submitted", "bundle_id": bundle_id}
+            except Exception:
+                return {"signature": bundle_id, "status": "jito_submitted", "bundle_id": bundle_id}
+
+        return None
+
+    except Exception as e:
+        logger.warning("[TRADE] Jito bundle submission failed: %s", e)
+        return None
+
+
+def _submit_rpc(signed_tx_b64: str) -> dict | None:
+    """Submit a transaction via regular Solana RPC (fallback from Jito)."""
+    rpc_url = config.QUICKNODE_HTTP_URL or "https://api.mainnet-beta.solana.com"
+    try:
+        resp = requests.post(rpc_url, json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                signed_tx_b64,
+                {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}
+            ],
+        }, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+
+        if "error" in result:
+            logger.error("[TRADE] RPC submit error: %s", result["error"])
+            return None
+
+        signature = result.get("result", "")
+        logger.info("[TRADE] RPC transaction submitted: %s", signature)
+        return {"signature": signature, "status": "submitted"}
+
+    except requests.RequestException as e:
+        logger.error("[TRADE] RPC submit failed: %s", e)
+        return None
+    if kp is None:
+        return None
+    return str(kp.pubkey())
+
+
 def get_quote(token_mint: str, amount_sol: float | None = None) -> dict | None:
     """Get a Jupiter swap quote for SOL -> token.
     
     Returns quote dict with expected output, price impact, route info.
+    Uses dynamic slippage based on token liquidity.
     """
     if amount_sol is None:
         amount_sol = config.TRADE_AMOUNT_SOL
 
     amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
+    slippage = _dynamic_slippage(token_mint, amount_sol)
 
     try:
         resp = requests.get(JUPITER_QUOTE_URL, params={
             "inputMint": SOL_MINT,
             "outputMint": token_mint,
             "amount": str(amount_lamports),
-            "slippageBps": config.TRADE_SLIPPAGE_BPS,
+            "slippageBps": slippage,
             "onlyDirectRoutes": "false",
         }, timeout=10)
         resp.raise_for_status()
@@ -175,7 +315,7 @@ def get_sell_quote(token_mint: str, token_amount: int) -> dict | None:
 def execute_swap(quote: dict) -> dict | None:
     """Execute a swap using a Jupiter quote.
     
-    Signs the transaction with the trading wallet and submits it.
+    Tries Jito bundle first (MEV-protected), falls back to regular RPC.
     Returns {"signature": str, "status": str} on success, None on failure.
     """
     from solders.keypair import Keypair  # type: ignore
@@ -216,41 +356,22 @@ def execute_swap(quote: dict) -> dict | None:
 
         tx_bytes = base64.b64decode(swap_tx_base64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
-
-        # Sign the transaction
         signed_tx = VersionedTransaction(tx.message, [kp])
         signed_bytes = bytes(signed_tx)
+        signed_b64 = base64.b64encode(signed_bytes).decode("utf-8")
 
     except Exception as e:
         logger.error("[TRADE] Transaction signing failed: %s", e)
         return None
 
-    # Submit to Solana RPC
-    rpc_url = config.QUICKNODE_HTTP_URL or "https://api.mainnet-beta.solana.com"
-    try:
-        resp = requests.post(rpc_url, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [
-                base64.b64encode(signed_bytes).decode("utf-8"),
-                {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}
-            ],
-        }, timeout=15)
-        resp.raise_for_status()
-        result = resp.json()
+    # Try Jito bundle first (MEV-protected)
+    result = _submit_jito_bundle(signed_b64)
+    if result:
+        return result
 
-        if "error" in result:
-            logger.error("[TRADE] Transaction submit error: %s", result["error"])
-            return None
-
-        signature = result.get("result", "")
-        logger.info("[TRADE] Transaction submitted: %s", signature)
-        return {"signature": signature, "status": "submitted"}
-
-    except requests.RequestException as e:
-        logger.error("[TRADE] Transaction submit failed: %s", e)
-        return None
+    # Fallback to regular RPC
+    logger.info("[TRADE] Jito bundle failed, falling back to regular RPC")
+    return _submit_rpc(signed_b64)
 
 
 def can_trade() -> tuple[bool, str]:
@@ -362,6 +483,7 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
 def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | None:
     """Execute a sell (token -> SOL) for an open position.
     
+    Retries with higher slippage if first attempt fails.
     Returns trade result dict or None on failure.
     """
     if not config.TRADING_ENABLED:
@@ -372,14 +494,28 @@ def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | N
         logger.warning("[TRADE] Sell blocked: no token amount")
         return None
 
-    # Get sell quote
-    quote = get_sell_quote(token_mint, token_amount)
-    if quote is None:
-        return None
+    # Try sell with normal slippage, then retry with higher if it fails
+    for attempt, slippage_mult in enumerate([1.0, 2.0, 3.0], 1):
+        extra_bps = int(config.TRADE_SLIPPAGE_BPS * slippage_mult)
+        quote = _get_sell_quote_with_slippage(token_mint, token_amount, extra_bps)
+        if quote is None:
+            if attempt < 3:
+                logger.warning("[TRADE] Sell quote failed (attempt %d/3), retrying with higher slippage", attempt)
+                time.sleep(1)
+                continue
+            return None
 
-    # Execute
-    result = execute_swap(quote)
-    if result is None:
+        result = execute_swap(quote)
+        if result is not None:
+            if attempt > 1:
+                logger.info("[TRADE] Sell succeeded on attempt %d with %d bps slippage", attempt, extra_bps)
+            break
+
+        if attempt < 3:
+            logger.warning("[TRADE] Sell swap failed (attempt %d/3), retrying with higher slippage", attempt)
+            time.sleep(1)
+    else:
+        logger.error("[TRADE] Sell failed after 3 attempts for %s", token_mint[:16])
         return None
 
     # Calculate SOL received
