@@ -101,10 +101,10 @@ class PoolListener:
 
             # Quick safety checks from token metadata
             if mint_authority:
-                logger.debug("[POOL] %s ($%s) -- mint authority active, skipping", mint[:16], symbol)
+                logger.info("[POOL] %s ($%s) -- mint authority active, skipping", mint[:16], symbol)
                 continue
             if freeze_authority:
-                logger.debug("[POOL] %s ($%s) -- freeze authority active, skipping", mint[:16], symbol)
+                logger.info("[POOL] %s ($%s) -- freeze authority active, skipping", mint[:16], symbol)
                 continue
 
             # Get RugCheck score
@@ -122,7 +122,7 @@ class PoolListener:
             cfg = config.get_chain_profile("solana")
             min_score = cfg.get("min_rugcheck_score", 0.5)
             if score < min_score:
-                logger.debug("[POOL] %s ($%s) -- RugCheck score %.2f < %.2f, skipping",
+                logger.info("[POOL] %s ($%s) -- RugCheck score %.2f < %.2f, skipping",
                              mint[:16], symbol, score, min_score)
                 continue
 
