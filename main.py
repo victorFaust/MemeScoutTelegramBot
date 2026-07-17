@@ -632,47 +632,57 @@ async def _cleanup_loop() -> None:
             logger.exception("Cleanup error")
 
 
-async def _wallet_discovery_loop() -> None:
-    """Periodically discover alpha wallets from tokens that pumped.
+async def _notify_new_wallets(newly_added: list[dict]) -> None:
+    """Send Telegram alerts for newly discovered wallets."""
+    total_tracked = wallet_tracker.get_wallet_count()
+    for w in newly_added:
+        addr = w["address"]
+        short_addr = f"{addr[:8]}...{addr[-6:]}"
+        tokens_str = ", ".join(f"${t}" for t in w["appeared_in"][:5])
 
-    Runs every 6 hours. Finds early buyers of winning tokens and adds
-    qualifying wallets to the tracked list.
+        alert_text = (
+            f"🔍 NEW ALPHA WALLET FOUND\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"👛 {short_addr}\n"
+            f"📊 Win Rate: {w['win_rate']:.0f}%\n"
+            f"📈 Trades: {w['winning_trades']}/{w['total_trades']} winning\n"
+            f"💰 Avg Return: {w['avg_return']:+.1f}%\n"
+            f"🏆 Early in: {tokens_str}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Auto-added to tracker ({total_tracked} total)\n"
+            f"Solscan: solscan.io/account/{addr}"
+        )
+        await tg.send_trade_notification(alert_text)
+
+
+async def _wallet_discovery_loop() -> None:
+    """Periodically discover alpha wallets from trending tokens + alert history.
+
+    Runs every 6 hours. On first run, bootstraps from DexScreener top gainers.
     """
-    # Wait 30 min on startup to let some alert outcomes accumulate
-    await asyncio.sleep(1800)
+    # Run trending discovery immediately on startup (no wait needed)
+    await asyncio.sleep(60)  # Just 1 min to let bot stabilize
 
     while True:
         try:
-            logger.info("[DISCOVERY] Starting alpha wallet discovery...")
-            newly_added = await asyncio.to_thread(wallet_tracker.discover_alpha_wallets)
+            # Phase 1: Bootstrap from trending tokens (always works, no history needed)
+            logger.info("[DISCOVERY] Starting trending token discovery...")
+            trending_added = await asyncio.to_thread(wallet_tracker.discover_from_trending)
+            if trending_added:
+                await _notify_new_wallets(trending_added)
+                logger.info("[DISCOVERY] Trending: %d new wallets", len(trending_added))
 
-            if newly_added:
-                total_tracked = wallet_tracker.get_wallet_count()
+            # Phase 2: Discover from our own alert winners (needs outcome data)
+            logger.info("[DISCOVERY] Starting alert history discovery...")
+            history_added = await asyncio.to_thread(wallet_tracker.discover_alpha_wallets)
+            if history_added:
+                await _notify_new_wallets(history_added)
+                logger.info("[DISCOVERY] History: %d new wallets", len(history_added))
 
-                for w in newly_added:
-                    addr = w["address"]
-                    short_addr = f"{addr[:8]}...{addr[-6:]}"
-                    tokens_str = ", ".join(f"${t}" for t in w["appeared_in"][:5])
-
-                    alert_text = (
-                        f"🔍 NEW ALPHA WALLET FOUND\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"👛 {short_addr}\n"
-                        f"📊 Win Rate: {w['win_rate']:.0f}%\n"
-                        f"📈 Trades: {w['winning_trades']}/{w['total_trades']} winning\n"
-                        f"💰 Avg Return: {w['avg_return']:+.1f}%\n"
-                        f"🏆 Early in: {tokens_str}\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"Auto-added to tracker ({total_tracked} total)\n"
-                        f"Solscan: solscan.io/account/{addr}"
-                    )
-                    await tg.send_trade_notification(alert_text)
-
-                logger.info("[DISCOVERY] Notified about %d new wallets", len(newly_added))
-            else:
+            if not trending_added and not history_added:
                 logger.info("[DISCOVERY] No new wallets found this cycle")
 
-            # Prune underperforming wallets
+            # Phase 3: Prune underperforming wallets
             pruned = await asyncio.to_thread(wallet_tracker.prune_underperforming_wallets)
             if pruned:
                 total_tracked = wallet_tracker.get_wallet_count()

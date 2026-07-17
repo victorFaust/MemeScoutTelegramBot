@@ -1242,6 +1242,43 @@ async def _handle_rmwallet_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text(f"Removed: {address[:12]}...")
 
 
+async def _handle_discover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /discover — manually trigger wallet discovery now."""
+    if not update.message:
+        return
+
+    import wallet_tracker
+
+    await update.message.reply_text("🔍 Scanning trending tokens for alpha wallets...\nThis may take 1-2 minutes.")
+
+    try:
+        newly_added = await asyncio.to_thread(wallet_tracker.discover_from_trending)
+    except Exception:
+        logger.exception("[BOT] Discover command crashed")
+        await update.message.reply_text("Discovery failed — check logs.")
+        return
+
+    if not newly_added:
+        await update.message.reply_text("No new alpha wallets found this scan.\nTry again later when market is more active.")
+        return
+
+    total = wallet_tracker.get_wallet_count()
+    lines = [f"🔍 Found {len(newly_added)} new alpha wallet(s)!\n"]
+
+    for w in newly_added:
+        addr = w["address"]
+        short_addr = f"{addr[:8]}...{addr[-6:]}"
+        tokens_str = ", ".join(f"${t}" for t in w["appeared_in"][:5])
+        lines.append(
+            f"👛 {short_addr}\n"
+            f"  WR: {w['win_rate']:.0f}% | {w['winning_trades']}/{w['total_trades']} wins\n"
+            f"  Avg: {w['avg_return']:+.1f}% | In: {tokens_str}"
+        )
+
+    lines.append(f"\n━━━━━━━━━━━━━━━━━━\nTotal tracked: {total}")
+    await update.message.reply_text("\n".join(lines))
+
+
 # -- Start Bot --
 
 async def start_bot_handler() -> None:

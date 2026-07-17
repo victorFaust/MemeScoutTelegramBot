@@ -653,3 +653,161 @@ def _update_wallet_stats(address: str, win_rate: float, total_trades: int,
         conn.commit()
     finally:
         conn.close()
+
+
+# -- Bootstrap Discovery: find alpha wallets from DexScreener top gainers --
+
+def discover_from_trending() -> list[dict]:
+    """Find alpha wallets by analyzing top gaining Solana memecoins right now.
+
+    Unlike discover_alpha_wallets() which needs our own alert history,
+    this bootstraps from DexScreener's current top gainers.
+
+    Flow:
+    1. Fetch top gaining Solana tokens from DexScreener
+    2. Filter for memecoin characteristics (low MC, recent, high volume)
+    3. Fetch early buyers of each via Helius
+    4. Score wallets appearing in 2+ different top gainers
+    5. Add qualifying wallets
+
+    Returns list of newly added wallets.
+    """
+    import dexscreener_client as dex
+
+    if not config.HELIUS_API_KEY:
+        logger.warning("[DISCOVERY] No HELIUS_API_KEY")
+        return []
+
+    # Step 1: Fetch trending Solana tokens from DexScreener
+    logger.info("[DISCOVERY] Fetching trending Solana tokens from DexScreener...")
+    try:
+        resp = requests.get(
+            "https://api.dexscreener.com/token-boosts/top/v1",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        boosted = resp.json()
+    except Exception as e:
+        logger.warning("[DISCOVERY] Failed to fetch boosted tokens: %s", e)
+        boosted = []
+
+    # Also fetch top gainers via search
+    try:
+        resp2 = requests.get(
+            "https://api.dexscreener.com/latest/dex/search",
+            params={"q": "solana"},
+            timeout=10,
+        )
+        resp2.raise_for_status()
+        search_data = resp2.json()
+        search_pairs = search_data.get("pairs") or []
+    except Exception:
+        search_pairs = []
+
+    # Combine and filter for Solana memecoins that pumped
+    winning_tokens = []
+
+    # From boosted tokens
+    for item in (boosted if isinstance(boosted, list) else []):
+        if (item.get("chainId") or "").lower() != "solana":
+            continue
+        addr = item.get("tokenAddress", "")
+        if addr:
+            winning_tokens.append(addr)
+
+    # From search — pick tokens with strong recent gains
+    for pair in search_pairs[:50]:
+        if (pair.get("chainId") or "").lower() != "solana":
+            continue
+        mc = pair.get("marketCap") or pair.get("fdv") or 0
+        if mc <= 0 or mc > 5_000_000:
+            continue
+        pc = pair.get("priceChange") or {}
+        h1 = pc.get("h1", 0) or 0
+        h24 = pc.get("h24", 0) or 0
+        if h1 > 30 or h24 > 50:
+            base = pair.get("baseToken") or {}
+            addr = base.get("address", "")
+            if addr and addr not in winning_tokens:
+                winning_tokens.append(addr)
+
+    winning_tokens = list(dict.fromkeys(winning_tokens))[:15]
+
+    if not winning_tokens:
+        logger.info("[DISCOVERY] No trending tokens found to analyze")
+        return []
+
+    logger.info("[DISCOVERY] Analyzing %d trending tokens for early buyers...", len(winning_tokens))
+
+    # Step 2: Fetch early buyers for each
+    wallet_hits: dict[str, list[str]] = {}
+
+    for token_addr in winning_tokens:
+        buyers = _fetch_early_buyers(token_addr, limit=15)
+
+        symbol = token_addr[:8]
+        try:
+            pairs = dex.fetch_pair_details("solana", token_addr)
+            if pairs:
+                base = pairs[0].get("baseToken") or {}
+                symbol = base.get("symbol", symbol)
+        except Exception:
+            pass
+
+        for buyer in buyers:
+            wallet_hits.setdefault(buyer, []).append(symbol)
+
+        logger.debug("[DISCOVERY] $%s: %d early buyers", symbol, len(buyers))
+        time.sleep(0.5)
+
+    # Step 3: Find wallets in 2+ different pumping tokens
+    candidates = {
+        addr: tokens for addr, tokens in wallet_hits.items()
+        if len(tokens) >= 2
+    }
+
+    if not candidates:
+        logger.info("[DISCOVERY] No wallets found in 2+ trending tokens")
+        return []
+
+    logger.info("[DISCOVERY] %d candidate wallets in 2+ trending tokens", len(candidates))
+
+    # Step 4: Score and add
+    existing = {w["address"] for w in get_tracked_wallets()}
+    newly_added = []
+    sorted_candidates = sorted(candidates.items(), key=lambda x: len(x[1]), reverse=True)[:10]
+
+    for addr, tokens in sorted_candidates:
+        if addr in existing:
+            continue
+
+        stats = _score_wallet(addr)
+        if stats is None:
+            continue
+
+        win_rate = stats["win_rate"]
+        total = stats["total_trades"]
+
+        if win_rate >= 50 and total >= 3:
+            label = f"Trend-{len(tokens)}hits"
+            add_wallet(addr, label, win_rate)
+
+            wallet_info = {
+                "address": addr,
+                "label": label,
+                "win_rate": win_rate,
+                "total_trades": total,
+                "winning_trades": stats["winning_trades"],
+                "avg_return": stats["avg_return"],
+                "appeared_in": tokens,
+            }
+            newly_added.append(wallet_info)
+            logger.info(
+                "[DISCOVERY] Added trending wallet: %s (WR=%.0f%%, in: %s)",
+                addr[:12], win_rate, ", ".join(tokens[:3])
+            )
+
+        time.sleep(1)
+
+    logger.info("[DISCOVERY] Trending discovery: %d new wallets added", len(newly_added))
+    return newly_added
