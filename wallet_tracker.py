@@ -336,13 +336,240 @@ def seed_default_wallets() -> None:
     These are commonly referenced smart money addresses from GMGN leaderboards.
     Users should verify and update this list via /addwallet command.
     """
-    # These are placeholder addresses -- user should replace with actual
-    # alpha wallets from gmgn.ai/sol/leaderboard
     starters = [
         # Format: (address, label, estimated_win_rate)
-        # User can add their own via /addwallet <address> <label>
     ]
     for addr, label, wr in starters:
         add_wallet(addr, label, wr)
     if starters:
         logger.info("[WALLET] Seeded %d starter wallets", len(starters))
+
+
+# -- Auto-Discovery: find alpha wallets from tokens that pumped --
+
+HELIUS_TOKEN_ACCOUNTS_URL = f"https://api.helius.xyz/v0/token-metadata?api-key={config.HELIUS_API_KEY}"
+HELIUS_SIGNATURES_URL = "https://api.helius.xyz/v0/addresses/{address}/transactions"
+
+
+def _fetch_early_buyers(token_address: str, limit: int = 30) -> list[str]:
+    """Fetch the earliest buyer wallets for a token using Helius parsed transactions.
+
+    Looks at the first swap transactions involving this token and extracts
+    buyer wallet addresses.
+    """
+    if not config.HELIUS_API_KEY:
+        return []
+
+    # Use Helius enhanced transaction history for the token mint
+    url = HELIUS_SIGNATURES_URL.format(address=token_address)
+    try:
+        resp = requests.get(url, params={
+            "api-key": config.HELIUS_API_KEY,
+            "limit": 100,
+            "type": "SWAP",
+        }, timeout=15)
+        resp.raise_for_status()
+        txs = resp.json()
+    except Exception as e:
+        logger.warning("[DISCOVERY] Failed to fetch txs for token %s: %s", token_address[:16], e)
+        return []
+
+    buyers = []
+    seen = set()
+
+    for tx in txs:
+        # Look at token transfers to find who received this token (= buyers)
+        token_transfers = tx.get("tokenTransfers") or []
+        for t in token_transfers:
+            mint = t.get("mint", "")
+            if mint != token_address:
+                continue
+            to_addr = t.get("toUserAccount", "")
+            if to_addr and to_addr not in seen and to_addr != token_address:
+                seen.add(to_addr)
+                buyers.append(to_addr)
+                if len(buyers) >= limit:
+                    return buyers
+
+    return buyers
+
+
+def _score_wallet(wallet_address: str) -> dict | None:
+    """Evaluate a wallet's recent trading performance using Helius.
+
+    Returns {win_rate, total_trades, winning_trades, avg_return} or None.
+    """
+    if not config.HELIUS_API_KEY:
+        return None
+
+    swaps = fetch_recent_swaps(wallet_address, limit=50)
+    if len(swaps) < 5:
+        return None  # Too few trades to evaluate
+
+    # Track buy→sell pairs per token
+    buys = {}  # token -> list of buy timestamps
+    sells = {}  # token -> list of sell timestamps
+
+    for swap in swaps:
+        token = swap.get("token_bought", "")
+        sold = swap.get("token_sold", "")
+
+        if token and token != SOL_MINT:
+            buys.setdefault(token, []).append(swap)
+        if sold and sold != SOL_MINT:
+            sells.setdefault(sold, []).append(swap)
+
+    # For each token bought, check if it's still on DexScreener and if price went up
+    import dexscreener_client as dex
+
+    total = 0
+    wins = 0
+    returns = []
+
+    tokens_to_check = list(buys.keys())[:20]  # Cap API calls
+
+    for token in tokens_to_check:
+        try:
+            pairs = dex.fetch_pair_details("solana", token)
+            if not pairs:
+                continue
+
+            pair = pairs[0]
+            current_price = float(pair.get("priceUsd", 0) or 0)
+            pc = pair.get("priceChange") or {}
+            change_24h = pc.get("h24", 0) or 0
+
+            total += 1
+            if change_24h > 0:
+                wins += 1
+                returns.append(change_24h)
+            else:
+                returns.append(change_24h)
+
+            time.sleep(0.3)  # Rate limit DexScreener
+        except Exception:
+            continue
+
+    if total < 3:
+        return None
+
+    win_rate = (wins / total) * 100
+    avg_return = sum(returns) / len(returns) if returns else 0
+
+    return {
+        "win_rate": round(win_rate, 1),
+        "total_trades": total,
+        "winning_trades": wins,
+        "avg_return": round(avg_return, 1),
+    }
+
+
+def discover_alpha_wallets() -> list[dict]:
+    """Auto-discover profitable wallets from tokens that pumped.
+
+    Flow:
+    1. Find tokens from alert_outcomes that gained 50%+ at 1h or 100%+ max_24h
+    2. Fetch their early buyers via Helius
+    3. Count how many winning tokens each wallet appeared in
+    4. Score wallets that appear in 2+ winners
+    5. Add qualifying wallets (WR >50%) to tracked list
+
+    Returns list of newly added wallets with their stats.
+    """
+    conn = sqlite3.connect(str(storage.DB_PATH))
+    conn.row_factory = sqlite3.Row
+
+    # Step 1: Find tokens that pumped significantly
+    try:
+        winners = conn.execute(
+            """SELECT DISTINCT token_address, token_symbol, price_at_alert, price_1h, max_price_24h
+               FROM alert_outcomes
+               WHERE (
+                   (price_1h IS NOT NULL AND price_at_alert > 0 AND (price_1h - price_at_alert) / price_at_alert > 0.3)
+                   OR
+                   (max_price_24h IS NOT NULL AND price_at_alert > 0 AND (max_price_24h - price_at_alert) / price_at_alert > 0.5)
+               )
+               AND rugged = 0
+               ORDER BY alerted_at DESC
+               LIMIT 20"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not winners:
+        logger.info("[DISCOVERY] No winning tokens found in outcomes yet")
+        return []
+
+    logger.info("[DISCOVERY] Found %d winning tokens to analyze", len(winners))
+
+    # Step 2: Fetch early buyers for each winner
+    wallet_hits: dict[str, list[str]] = {}  # wallet -> [token_symbols they bought early]
+
+    for w in winners:
+        token_addr = w["token_address"]
+        symbol = w["token_symbol"] or token_addr[:8]
+
+        buyers = _fetch_early_buyers(token_addr, limit=20)
+        logger.debug("[DISCOVERY] $%s: found %d early buyers", symbol, len(buyers))
+
+        for buyer in buyers:
+            wallet_hits.setdefault(buyer, []).append(symbol)
+
+        time.sleep(0.5)  # Rate limit
+
+    # Step 3: Filter wallets that appear in 2+ winning tokens
+    candidates = {
+        addr: tokens for addr, tokens in wallet_hits.items()
+        if len(tokens) >= 2
+    }
+
+    if not candidates:
+        logger.info("[DISCOVERY] No wallets found in 2+ winners")
+        return []
+
+    logger.info("[DISCOVERY] %d candidate wallets found in 2+ winners", len(candidates))
+
+    # Step 4: Score top candidates and add qualifying ones
+    # Already tracked addresses
+    existing = {w["address"] for w in get_tracked_wallets()}
+
+    newly_added = []
+    # Sort by most appearances first, cap at 10 to avoid API spam
+    sorted_candidates = sorted(candidates.items(), key=lambda x: len(x[1]), reverse=True)[:10]
+
+    for addr, tokens in sorted_candidates:
+        if addr in existing:
+            continue
+
+        # Quick score via Helius
+        stats = _score_wallet(addr)
+        if stats is None:
+            continue
+
+        win_rate = stats["win_rate"]
+        total = stats["total_trades"]
+
+        # Qualify: >50% win rate and appeared in 2+ winners
+        if win_rate >= 50 and total >= 3:
+            label = f"Auto-{len(tokens)}wins"
+            add_wallet(addr, label, win_rate)
+
+            wallet_info = {
+                "address": addr,
+                "label": label,
+                "win_rate": win_rate,
+                "total_trades": total,
+                "winning_trades": stats["winning_trades"],
+                "avg_return": stats["avg_return"],
+                "appeared_in": tokens,
+            }
+            newly_added.append(wallet_info)
+            logger.info(
+                "[DISCOVERY] Added alpha wallet: %s (WR=%.0f%%, %d trades, in %d winners: %s)",
+                addr[:12], win_rate, total, len(tokens), ", ".join(tokens[:3])
+            )
+
+        time.sleep(1)  # Rate limit between wallet scores
+
+    logger.info("[DISCOVERY] Discovery complete: %d new wallets added", len(newly_added))
+    return newly_added
