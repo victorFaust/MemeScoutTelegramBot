@@ -416,6 +416,23 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
             market_cap=mc,
         )
 
+    # Rate limits: prevent spam buys
+    MAX_BUYS_PER_WALLET_PER_HOUR = 3
+    MAX_TOTAL_COPY_BUYS_PER_HOUR = 5
+
+    wallet_recent = wallet_tracker.get_wallet_buy_count_recent(wallet_address, minutes=60)
+    total_recent = wallet_tracker.get_total_copy_buys_recent(minutes=60)
+
+    if wallet_recent >= MAX_BUYS_PER_WALLET_PER_HOUR:
+        logger.info("[WALLET] $%s rate-limited: wallet %s has %d buys in last hour (max %d)",
+                    symbol, wallet_address[:12], wallet_recent, MAX_BUYS_PER_WALLET_PER_HOUR)
+        return
+
+    if total_recent >= MAX_TOTAL_COPY_BUYS_PER_HOUR:
+        logger.info("[WALLET] $%s rate-limited: %d total copy-buys in last hour (max %d)",
+                    symbol, total_recent, MAX_TOTAL_COPY_BUYS_PER_HOUR)
+        return
+
     # Auto-buy decision
     should_buy = (
         config.AUTO_BUY_ENABLED
@@ -461,6 +478,7 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
                     token_address
                 )
                 logger.info("[WALLET] Copy-bought $%s for $%.0f (confidence=%d)", symbol, buy_usd, confidence)
+                wallet_tracker.mark_buy_acted(wallet_address, token_address)
             else:
                 logger.warning("[WALLET] Copy-buy failed for $%s", symbol)
         else:

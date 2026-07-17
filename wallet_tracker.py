@@ -133,6 +133,47 @@ def was_buy_already_seen(wallet: str, token: str) -> bool:
         conn.close()
 
 
+def get_wallet_buy_count_recent(wallet: str, minutes: int = 60) -> int:
+    """Count how many buys a wallet made in the last N minutes."""
+    conn = _connect()
+    try:
+        cutoff = time.time() - (minutes * 60)
+        row = conn.execute(
+            "SELECT COUNT(*) FROM wallet_buys WHERE wallet_address = ? AND detected_at > ?",
+            (wallet, cutoff),
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+def get_total_copy_buys_recent(minutes: int = 60) -> int:
+    """Count total copy-buys across all wallets in the last N minutes."""
+    conn = _connect()
+    try:
+        cutoff = time.time() - (minutes * 60)
+        row = conn.execute(
+            "SELECT COUNT(*) FROM wallet_buys WHERE acted_on = 1 AND detected_at > ?",
+            (cutoff,),
+        ).fetchone()
+        return row[0] if row else 0
+    finally:
+        conn.close()
+
+
+def mark_buy_acted(wallet: str, token: str) -> None:
+    """Mark a wallet buy as acted on (copy-traded)."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE wallet_buys SET acted_on = 1 WHERE wallet_address = ? AND token_address = ?",
+            (wallet, token),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def record_wallet_buy(wallet: str, token: str, signature: str, confidence: int) -> None:
     """Record that a tracked wallet bought a token."""
     conn = _connect()
