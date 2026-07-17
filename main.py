@@ -632,6 +632,53 @@ async def _cleanup_loop() -> None:
             logger.exception("Cleanup error")
 
 
+async def _wallet_discovery_loop() -> None:
+    """Periodically discover alpha wallets from tokens that pumped.
+
+    Runs every 6 hours. Finds early buyers of winning tokens and adds
+    qualifying wallets to the tracked list.
+    """
+    # Wait 30 min on startup to let some alert outcomes accumulate
+    await asyncio.sleep(1800)
+
+    while True:
+        try:
+            logger.info("[DISCOVERY] Starting alpha wallet discovery...")
+            newly_added = await asyncio.to_thread(wallet_tracker.discover_alpha_wallets)
+
+            if newly_added:
+                total_tracked = wallet_tracker.get_wallet_count()
+
+                for w in newly_added:
+                    addr = w["address"]
+                    short_addr = f"{addr[:8]}...{addr[-6:]}"
+                    tokens_str = ", ".join(f"${t}" for t in w["appeared_in"][:5])
+
+                    alert_text = (
+                        f"🔍 NEW ALPHA WALLET FOUND\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"👛 {short_addr}\n"
+                        f"📊 Win Rate: {w['win_rate']:.0f}%\n"
+                        f"📈 Trades: {w['winning_trades']}/{w['total_trades']} winning\n"
+                        f"💰 Avg Return: {w['avg_return']:+.1f}%\n"
+                        f"🏆 Early in: {tokens_str}\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"Auto-added to tracker ({total_tracked} total)\n"
+                        f"Solscan: solscan.io/account/{addr}"
+                    )
+                    await tg.send_trade_notification(alert_text)
+
+                logger.info("[DISCOVERY] Notified about %d new wallets", len(newly_added))
+            else:
+                logger.info("[DISCOVERY] No new wallets found this cycle")
+
+        except Exception:
+            logger.exception("[DISCOVERY] Error in discovery loop")
+
+        # Run every 6 hours
+        await asyncio.sleep(21600)
+
+
 async def _tx_confirmation_loop() -> None:
     """Poll RPC for pending buy transaction confirmations.
 
@@ -742,6 +789,7 @@ async def main() -> None:
     asyncio.create_task(_exit_monitor_loop())
     asyncio.create_task(_pnl_notification_loop())
     asyncio.create_task(_tx_confirmation_loop())
+    asyncio.create_task(_wallet_discovery_loop())
 
     # Start new token discovery (RugCheck feed)
     listener = pool_listener.PoolListener(on_new_pool=_handle_new_pool)
