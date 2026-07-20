@@ -301,11 +301,12 @@ def _parse_helius_swap(tx: dict, wallet_address: str) -> dict | None:
 
 # -- Main Polling Loop --
 
-async def poll_tracked_wallets(on_new_buy) -> None:
-    """Continuously poll tracked wallets for new buys.
+async def poll_tracked_wallets(on_new_buy, on_wallet_sell=None) -> None:
+    """Continuously poll tracked wallets for new buys and sells.
 
     Args:
         on_new_buy: async callback(wallet_address, token_address, confidence, signature)
+        on_wallet_sell: async callback(wallet_address, token_address, signature) or None
     """
     if not config.HELIUS_API_KEY:
         logger.warning("[WALLET] No HELIUS_API_KEY -- wallet tracker disabled")
@@ -326,12 +327,36 @@ async def poll_tracked_wallets(on_new_buy) -> None:
                 swaps = await asyncio.to_thread(fetch_recent_swaps, address, 5)
 
                 for swap in swaps:
-                    token = swap.get("token_bought", "")
+                    token_bought = swap.get("token_bought", "")
+                    token_sold = swap.get("token_sold", "")
                     sig = swap.get("signature", "")
 
-                    # Skip sells (token_bought == SOL) and skip SOL itself
-                    if not token or token == SOL_MINT:
+                    # Detect SELLS: wallet sold a token (token_sold != SOL, token_bought == SOL)
+                    if on_wallet_sell and token_sold and token_sold != SOL_MINT and token_bought == SOL_MINT:
+                        # Dedup by wallet+token+chain (6h)
+                        if not storage.was_wallet_sell_seen(address, token_sold, "solana"):
+                            storage.record_wallet_sell(
+                                wallet_address=address,
+                                token_address=token_sold,
+                                chain_id="solana",
+                                signature=sig,
+                            )
+                            logger.info(
+                                "[WALLET] Sell detected: %s sold %s (sig=%s)",
+                                address[:12],
+                                token_sold[:16],
+                                sig[:16],
+                            )
+                            try:
+                                await on_wallet_sell(address, token_sold, sig)
+                            except Exception:
+                                logger.exception("[WALLET] Sell callback error for %s", token_sold[:16])
+
+                    # Detect BUYS: wallet bought a token
+                    if not token_bought or token_bought == SOL_MINT:
                         continue
+
+                    token = token_bought
 
                     # Skip if we already saw this
                     if was_buy_already_seen(address, token):
@@ -349,7 +374,10 @@ async def poll_tracked_wallets(on_new_buy) -> None:
 
                     logger.info(
                         "[WALLET] New buy detected: %s bought %s (confidence=%d, sig=%s)",
-                        address[:12], token[:16], confidence, sig[:16]
+                        address[:12],
+                        token[:16],
+                        confidence,
+                        sig[:16],
                     )
 
                     # Fire callback
