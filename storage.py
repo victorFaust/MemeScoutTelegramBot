@@ -83,6 +83,26 @@ CREATE TABLE IF NOT EXISTS positions (
     tx_status       TEXT DEFAULT 'pending'
 );
 
+CREATE TABLE IF NOT EXISTS wallet_sells (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet_address TEXT NOT NULL,
+    token_address  TEXT NOT NULL,
+    chain_id        TEXT NOT NULL,
+    detected_at    REAL NOT NULL,
+    signature      TEXT,
+    acted_on        INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS position_exit_state (
+    position_id        INTEGER PRIMARY KEY,
+    stage1_done        INTEGER DEFAULT 0,
+    stage2_done        INTEGER DEFAULT 0,
+    final_trailing_peak REAL,
+    final_trailing_active INTEGER DEFAULT 0,
+    peak_pnl_pct        REAL,
+    last_updated_at    REAL
+);
+
 CREATE TABLE IF NOT EXISTS watchlist (
     token_address TEXT PRIMARY KEY,
     symbol        TEXT,
@@ -336,6 +356,107 @@ def cleanup_stale_metrics(hours: int = 24) -> None:
     conn = _connect()
     try:
         conn.execute("DELETE FROM token_metrics WHERE recorded_at < ?", (cutoff,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# -- Wallet sells (alpha wallet mirrors) --
+
+def _ensure_exit_state_row(position_id: int) -> None:
+    """Ensure there's an exit-state row for a position."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO position_exit_state (position_id, last_updated_at) VALUES (?, ?)",
+            (position_id, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_wallet_sell(
+    wallet_address: str,
+    token_address: str,
+    chain_id: str,
+    signature: str,
+) -> None:
+    """Record that a tracked smart wallet sold a token."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO wallet_sells (wallet_address, token_address, chain_id, detected_at, signature) VALUES (?, ?, ?, ?, ?)",
+            (wallet_address, token_address, chain_id, time.time(), signature),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def was_wallet_sell_seen(
+    wallet_address: str,
+    token_address: str,
+    chain_id: str,
+    cutoff_seconds: float = 6 * 3600,
+) -> bool:
+    """Dedup wallet sell events to avoid re-triggering exits."""
+    cutoff = time.time() - cutoff_seconds
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM wallet_sells WHERE wallet_address = ? AND token_address = ? AND chain_id = ? AND detected_at > ?",
+            (wallet_address, token_address, chain_id, cutoff),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def get_open_positions_by_token(token_address: str, chain_id: str = "solana") -> list[dict]:
+    """Get open positions for a token."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE status = 'open' AND token_address = ? AND chain_id = ? ORDER BY bought_at DESC",
+            (token_address, chain_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_exit_state(position_id: int) -> dict | None:
+    """Get exit-stage state for a position."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM position_exit_state WHERE position_id = ?",
+            (position_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def update_exit_state(position_id: int, **fields: Any) -> None:
+    """Update exit-state fields for a position."""
+    if not fields:
+        return
+    conn = _connect()
+    try:
+        _ensure_exit_state_row(position_id)
+        fields = dict(fields)
+        fields["last_updated_at"] = time.time()
+        sets = ", ".join([f"{k} = ?" for k in fields.keys()])
+        vals = list(fields.values())
+        vals.append(position_id)
+        conn.execute(
+            f"UPDATE position_exit_state SET {sets} WHERE position_id = ?",
+            vals,
+        )
         conn.commit()
     finally:
         conn.close()

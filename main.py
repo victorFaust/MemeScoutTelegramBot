@@ -10,20 +10,21 @@ from logging.handlers import RotatingFileHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+import bot_handler
 import config
 import dexscreener_client as dex
-import filters
 import feature_logger
 import holder_analysis
 import performance_tracker
 import pool_listener
-import bot_handler
 import rugcheck
 import safety_check
 import startup_check
 import storage
 import telegram_notifier as tg
 import wallet_tracker
+
+logger = logging.getLogger(__name__)
 
 
 def _setup_logging() -> None:
@@ -44,22 +45,15 @@ def _setup_logging() -> None:
     root.addHandler(fh)
 
 
-logger = logging.getLogger(__name__)
-
-
 # -- Rate limit guard --
-# Rolling window of API call timestamps (shared across all chain jobs)
 _api_call_log: deque = deque()
-_RATE_LIMIT_WINDOW = 60       # seconds
-_MAX_CALLS_PER_WINDOW = 250   # headroom under DexScreener 300/min limit
+_RATE_LIMIT_WINDOW = 60  # seconds
+_MAX_CALLS_PER_WINDOW = 250  # headroom under DexScreener 300/min limit
 
-# Priority: lower = higher priority (runs first when throttled)
 _CHAIN_PRIORITY: dict[str, int] = {
     "robinhood": 1,
     "solana": 2,
 }
-
-# Per-chain last-run tracking
 _chain_last_run: dict[str, float] = {}
 
 
@@ -103,13 +97,16 @@ async def _run_chain_cycle(chain_id: str) -> None:
     """Single polling cycle scoped to one chain."""
     priority = _CHAIN_PRIORITY.get(chain_id, 99)
 
-    # Rate limit check -- lower-priority chains yield when throttled
     if not _can_make_calls(5):
-        logger.warning("[%s] Rate limit approaching (%d/%d calls in window) -- skipping cycle (priority=%d)",
-                       chain_id, _calls_in_window(), _MAX_CALLS_PER_WINDOW, priority)
+        logger.warning(
+            "[%s] Rate limit approaching (%d/%d calls in window) -- skipping cycle (priority=%d)",
+            chain_id,
+            _calls_in_window(),
+            _MAX_CALLS_PER_WINDOW,
+            priority,
+        )
         return
 
-    # Discover tokens for this chain only
     tokens = dex.discover_tokens([chain_id])
     _record_calls(2)  # boosts + profiles endpoints
     logger.info("[%s] Cycle start -- %d tokens discovered", chain_id, len(tokens))
@@ -117,8 +114,11 @@ async def _run_chain_cycle(chain_id: str) -> None:
     all_pairs: list[dict] = []
     for tok in tokens:
         if not _can_make_calls(1):
-            logger.warning("[%s] Rate limit reached mid-cycle (%d calls), stopping fetch",
-                           chain_id, _calls_in_window())
+            logger.warning(
+                "[%s] Rate limit reached mid-cycle (%d calls), stopping fetch",
+                chain_id,
+                _calls_in_window(),
+            )
             break
         pairs = dex.fetch_pair_details(tok["chainId"], tok["tokenAddress"])
         _record_calls(1)
@@ -126,27 +126,27 @@ async def _run_chain_cycle(chain_id: str) -> None:
 
     logger.info("[%s] Fetched %d pairs", chain_id, len(all_pairs))
 
-    # Score ALL pairs (including below threshold) for momentum tracking
     scored = filters.filter_and_score(all_pairs, min_score=0)
-    above_threshold = [r for r in scored if r["score"] >= (config.get_chain_profile(chain_id).get("min_alert_score", 40))]
+    above_threshold = [
+        r
+        for r in scored
+        if r["score"] >= config.get_chain_profile(chain_id).get("min_alert_score", 40)
+    ]
     logger.info("[%s] %d scored, %d above threshold", chain_id, len(scored), len(above_threshold))
 
-    # Store metrics for ALL scored pairs (enables momentum detection)
     for result in scored:
         pair = result["pair"]
         base = pair.get("baseToken") or {}
         addr = base.get("address") or ""
-        if addr:
-            vol = (pair.get("volume") or {}).get("h24", 0) or 0
-            liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
-            vlr = vol / liq if liq > 0 else 0
-            txns = (pair.get("txns") or {}).get("h1") or {}
-            buys = txns.get("buys", 0) or 0
-            sells = txns.get("sells", 0) or 0
-            bsr = buys / sells if sells > 0 else buys
-            storage.upsert_metrics(addr, chain_id, pair.get("pairAddress", ""), vlr, bsr, result["score"])
+        if not addr:
+            continue
 
-    sent = 0
+        vol = (pair.get("volume") or {}).get("h24", 0) or 0
+        liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
+        vlr = vol / liq if liq > 0 else 0
+        txns = (pair.get("txns") or {}).get("h1") or {}
+        buys = txns.get("buys", 0) or 0
+        sells = txns.get("sells", 0) or 0
     cfg = config.get_chain_profile(chain_id)
 
     # Only process tokens above the alert threshold for actual alerts
@@ -322,6 +322,37 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
     5. Auto-buy if enabled and confidence >= 2 (or if single high-WR wallet)
     """
     chain_id = "solana"
+
+
+async def _handle_wallet_sell(wallet_address: str, token_address: str, signature: str) -> None:
+    """Alpha-exit mirroring: if a tracked wallet sells, exit our position too.
+
+    For Phase A we trigger a safety “bag prevention” exit by marking staged exits
+    as fully consumed and forcing the exit monitor to sell remaining with the
+    trailing stage immediately on next tick.
+    """
+    try:
+        chain_id = "solana"
+        open_positions = storage.get_open_positions_by_token(token_address, chain_id=chain_id)
+        if not open_positions:
+            return
+
+        for pos in open_positions:
+            pos_id = pos["id"]
+            state = storage.get_exit_state(pos_id) or {}
+            # Force: stage1 & stage2 consumed, enable final trailing.
+            # The exit loop will then apply trailing/stop-loss for the remaining.
+            storage.update_exit_state(
+                pos_id,
+                stage1_done=1,
+                stage2_done=1,
+                final_trailing_active=1,
+            )
+            logger.info("[ALPHA-EXIT] Marked exit stages for position #%d (%s) due to wallet sell by %s",
+                        pos_id, token_address[:16], wallet_address[:12])
+
+    except Exception as e:
+        logger.error("[ALPHA-EXIT] Failed to handle wallet sell: %s", e)
 
     logger.info("[WALLET] Processing buy: wallet=%s token=%s confidence=%d", wallet_address[:12], token_address[:16], confidence)
 
