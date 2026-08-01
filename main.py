@@ -585,12 +585,12 @@ async def _exit_monitor_loop() -> None:
     """
     import executor
 
-    trail_pct = abs(config.STOP_LOSS_PCT)  # reuse SL value as trail distance
-    logger.info("[EXIT] Auto-exit started (TP=+%.0f%%, Trail=%.0f%% from peak, interval=%ds)",
-                config.TAKE_PROFIT_PCT, trail_pct, config.EXIT_CHECK_INTERVAL)
+    trail_pct = abs(config.STOP_LOSS_PCT)
+    logger.info("[EXIT] Auto-exit started (DCA stages: +%.0f%%/+%.0f%%, Trail=%.0f%%, interval=%ds)",
+                config.DCA_STAGE1_PCT, config.DCA_STAGE2_PCT, trail_pct, config.EXIT_CHECK_INTERVAL)
 
-    # Track peak PnL per position ID
     peak_pnl: dict[int, float] = {}
+    dca_stage: dict[int, int] = {}  # pos_id -> stages completed (0, 1, or 2)
 
     while True:
         await asyncio.sleep(config.EXIT_CHECK_INTERVAL)
@@ -606,6 +606,7 @@ async def _exit_monitor_loop() -> None:
         # Clean up peaks for closed positions
         open_ids = {p["id"] for p in positions}
         peak_pnl = {k: v for k, v in peak_pnl.items() if k in open_ids}
+        dca_stage = {k: v for k, v in dca_stage.items() if k in open_ids}
 
         for pos in positions:
             try:
@@ -628,39 +629,56 @@ async def _exit_monitor_loop() -> None:
                     peak_pnl[pos_id] = pnl_pct
                     prev_peak = pnl_pct
 
-                # Take profit — partial sell (sell PARTIAL_SELL_PCT, let rest ride with trail)
-                if pnl_pct >= config.TAKE_PROFIT_PCT:
-                    sell_pct = config.PARTIAL_SELL_PCT
-                    logger.info("[EXIT] TAKE PROFIT: $%s at +%.0f%% (selling %.0f%%)", token, pnl_pct, sell_pct)
+                # DCA Stage 1: sell 33% at +50%
+                stage = dca_stage.get(pos_id, 0)
+                if stage < 1 and pnl_pct >= config.DCA_STAGE1_PCT:
+                    logger.info("[EXIT] DCA STAGE 1: $%s at +%.0f%% (selling %.0f%%)", token, pnl_pct, config.DCA_SELL_EACH)
                     result = await asyncio.to_thread(
-                        executor.sell_partial, pos_id, pos["token_address"], pos["token_amount"], sell_pct
+                        executor.sell_partial, pos_id, pos["token_address"], pos["token_amount"], config.DCA_SELL_EACH
                     )
                     if result:
+                        dca_stage[pos_id] = 1
+                        peak_pnl[pos_id] = pnl_pct
                         await tg.send_trade_notification(
-                            f"PARTIAL SELL (TP +{pnl_pct:.0f}%) ${token} | Sold {sell_pct:.0f}% | {result['sol_received']:.4f} SOL | {result['remaining']} tokens left",
+                            f"📊 DCA SELL 1/3: ${token} +{pnl_pct:.0f}%\n"
+                            f"Sold {config.DCA_SELL_EACH:.0f}% | {result['sol_received']:.4f} SOL | {result['remaining']} tokens left",
                             pos["token_address"]
                         )
-                        # Set peak for trailing the remaining position
-                        peak_pnl[pos_id] = pnl_pct
                     continue
 
-                # Trailing stop-loss: sell if dropped trail_pct from peak
-                # Only activate trailing after position is in profit (peak > 0)
-                if prev_peak > 10 and (prev_peak - pnl_pct) >= trail_pct:
-                    logger.info("[EXIT] TRAIL STOP: $%s peak=+%.0f%% now=+%.0f%% (dropped %.0f%%)",
-                                token, prev_peak, pnl_pct, prev_peak - pnl_pct)
+                # DCA Stage 2: sell another 33% at +100%
+                if stage < 2 and pnl_pct >= config.DCA_STAGE2_PCT:
+                    logger.info("[EXIT] DCA STAGE 2: $%s at +%.0f%% (selling %.0f%%)", token, pnl_pct, config.DCA_SELL_EACH)
+                    result = await asyncio.to_thread(
+                        executor.sell_partial, pos_id, pos["token_address"], pos["token_amount"], config.DCA_SELL_EACH
+                    )
+                    if result:
+                        dca_stage[pos_id] = 2
+                        peak_pnl[pos_id] = pnl_pct
+                        await tg.send_trade_notification(
+                            f"📊 DCA SELL 2/3: ${token} +{pnl_pct:.0f}%\n"
+                            f"Sold {config.DCA_SELL_EACH:.0f}% | {result['sol_received']:.4f} SOL | {result['remaining']} tokens left",
+                            pos["token_address"]
+                        )
+                    continue
+
+                # Stage 3: trailing stop on remaining position (activates after stage 1+)
+                if stage >= 1 and prev_peak > 0 and (prev_peak - pnl_pct) >= trail_pct:
+                    logger.info("[EXIT] TRAIL STOP: $%s peak=+%.0f%% now=+%.0f%% (stage=%d)",
+                                token, prev_peak, pnl_pct, stage)
                     result = await asyncio.to_thread(
                         executor.sell_token, pos_id, pos["token_address"], pos["token_amount"]
                     )
                     if result:
                         await tg.send_trade_notification(
-                            f"SOLD (Trail) ${token} | Peak +{prev_peak:.0f}% -> +{pnl_pct:.0f}% | {result['sol_received']:.4f} SOL",
+                            f"📊 DCA SELL {stage + 1}/3 (Trail): ${token}\n"
+                            f"Peak +{prev_peak:.0f}% → +{pnl_pct:.0f}% | {result['sol_received']:.4f} SOL",
                             pos["token_address"]
                         )
                     continue
 
-                # Hard stop-loss (below entry, no trailing)
-                if pnl_pct <= config.STOP_LOSS_PCT:
+                # Hard stop-loss before any DCA stage fires (below entry)
+                if stage == 0 and pnl_pct <= config.STOP_LOSS_PCT:
                     logger.info("[EXIT] STOP LOSS: $%s at %.0f%%", token, pnl_pct)
                     result = await asyncio.to_thread(
                         executor.sell_token, pos_id, pos["token_address"], pos["token_amount"]
