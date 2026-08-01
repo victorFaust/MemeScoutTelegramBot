@@ -507,6 +507,57 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
             logger.info("[WALLET] Copy-buy skipped for $%s: %s", symbol, reason)
 
 
+async def _handle_wallet_sell(wallet_address: str, token_address: str, signature: str) -> None:
+    """When a tracked wallet sells a token, exit any matching open position."""
+    import executor
+
+    wallets = wallet_tracker.get_tracked_wallets()
+    wallet_info = next((w for w in wallets if w["address"] == wallet_address), {})
+    wallet_label = wallet_info.get("label") or wallet_address[:12]
+
+    positions = storage.get_open_positions()
+    matching = [p for p in positions if p.get("token_address") == token_address]
+
+    if not matching:
+        logger.info("[WALLET] $%s sold by %s -- no matching position to exit",
+                    token_address[:16], wallet_label)
+        return
+
+    if not config.TRADING_ENABLED:
+        logger.info("[WALLET] Sell signal from %s for %s -- trading disabled, skipping",
+                    wallet_label, token_address[:16])
+        return
+
+    for pos in matching:
+        symbol = pos.get("token_symbol") or pos.get("token_address", "")[:8]
+        logger.info("[WALLET] Copy-sell triggered: %s exited $%s -- closing position #%d",
+                    wallet_label, symbol, pos["id"])
+
+        result = await asyncio.to_thread(
+            executor.sell_token, pos["id"], pos["token_address"], pos["token_amount"]
+        )
+        if result:
+            sol_received = result.get("sol_received", 0)
+            pnl_sol = sol_received - pos.get("buy_amount_sol", 0)
+            pnl_pct = (pnl_sol / pos["buy_amount_sol"] * 100) if pos.get("buy_amount_sol") else 0
+            sign = "+" if pnl_pct >= 0 else ""
+            emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            await tg.send_trade_notification(
+                f"{emoji} COPY-SELL: ${symbol}\n"
+                f"Reason: {wallet_label} exited\n"
+                f"Received: {sol_received:.4f} SOL\n"
+                f"PnL: {sign}{pnl_pct:.1f}% ({sign}{pnl_sol:.4f} SOL)\n"
+                f"Their tx: solscan.io/tx/{signature[:32]}..."
+            )
+            logger.info("[WALLET] Copy-sold $%s for %.4f SOL (PnL %s%.1f%%)", symbol, sol_received, sign, pnl_pct)
+        else:
+            logger.warning("[WALLET] Copy-sell failed for $%s position #%d", symbol, pos["id"])
+            await tg.send_trade_notification(
+                f"⚠️ COPY-SELL FAILED: ${symbol}\n"
+                f"{wallet_label} exited but our sell failed. Check position manually."
+            )
+
+
 # -- Background tasks (independent of per-chain scheduling) --
 
 async def _snapshot_loop() -> None:
@@ -892,7 +943,7 @@ async def main() -> None:
     asyncio.create_task(listener.start())
 
     # Start smart wallet tracker (copy-trading)
-    asyncio.create_task(wallet_tracker.poll_tracked_wallets(_handle_wallet_buy))
+    asyncio.create_task(wallet_tracker.poll_tracked_wallets(_handle_wallet_buy, _handle_wallet_sell))
 
     # Start Telegram bot handler (for buy buttons + commands)
     asyncio.create_task(bot_handler.start_bot_handler())
