@@ -56,10 +56,15 @@ MAX_OPEN_POSITIONS: int = _int("MAX_OPEN_POSITIONS", 5)
 DAILY_LOSS_LIMIT_SOL: float = _float("DAILY_LOSS_LIMIT_SOL", 1.0)
 TRADE_SLIPPAGE_BPS: int = _int("TRADE_SLIPPAGE_BPS", 500)  # 5% default slippage
 TRADING_ENABLED: bool = os.getenv("TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
-TAKE_PROFIT_PCT: float = _float("TAKE_PROFIT_PCT", 100.0)  # Sell at +100% (2x)
-PARTIAL_SELL_PCT: float = _float("PARTIAL_SELL_PCT", 50.0)  # Sell this % of position at TP
-STOP_LOSS_PCT: float = _float("STOP_LOSS_PCT", -20.0)      # Hard SL / trail distance
-EXIT_CHECK_INTERVAL: int = _int("EXIT_CHECK_INTERVAL", 15)  # Check exits every 15s
+TAKE_PROFIT_PCT: float = _float("TAKE_PROFIT_PCT", 100.0)
+PARTIAL_SELL_PCT: float = _float("PARTIAL_SELL_PCT", 50.0)
+STOP_LOSS_PCT: float = _float("STOP_LOSS_PCT", -20.0)
+EXIT_CHECK_INTERVAL: int = _int("EXIT_CHECK_INTERVAL", 15)
+
+# DCA exit stages (sell in thirds: 33% at stage1, 33% at stage2, remainder with trail)
+DCA_STAGE1_PCT: float = _float("DCA_STAGE1_PCT", 50.0)   # +50% → sell 33%
+DCA_STAGE2_PCT: float = _float("DCA_STAGE2_PCT", 100.0)  # +100% → sell 33%
+DCA_SELL_EACH: float = _float("DCA_SELL_EACH", 33.0)     # % of position to sell each stage
 
 # Auto-buy (fully autonomous mode)
 AUTO_BUY_ENABLED: bool = os.getenv("AUTO_BUY_ENABLED", "false").lower() in ("1", "true", "yes")
