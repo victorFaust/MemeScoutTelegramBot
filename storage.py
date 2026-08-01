@@ -431,6 +431,20 @@ def get_closed_positions(limit: int = 10) -> list[dict]:
         conn.close()
 
 
+def get_closed_positions_since(since_ts: float) -> list[dict]:
+    """Get closed positions since a given timestamp."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE status = 'closed' AND sold_at >= ? ORDER BY sold_at DESC",
+            (since_ts,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_pending_positions() -> list[dict]:
     """Get positions with unconfirmed transactions."""
     conn = _connect()

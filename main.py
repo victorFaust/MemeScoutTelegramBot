@@ -721,48 +721,97 @@ async def _exit_monitor_loop() -> None:
 
 
 async def _pnl_notification_loop() -> None:
-    """Send periodic PnL updates for open positions (every 15 min)."""
+    """Live portfolio update every 15 min + daily summary + weekly summary."""
     import executor
+    from datetime import datetime, timezone
+
+    last_daily: float = 0
+    last_weekly: float = 0
 
     while True:
-        await asyncio.sleep(900)  # 15 minutes
+        await asyncio.sleep(900)
 
         if not config.TRADING_ENABLED:
             continue
 
-        positions = storage.get_open_positions()
-        if not positions:
-            continue
+        now_utc = datetime.now(timezone.utc)
+        now_ts = time.time()
 
-        lines = ["PORTFOLIO UPDATE\n"]
-        total_invested = 0.0
-        total_current = 0.0
-
-        for pos in positions:
-            try:
-                pnl = await asyncio.to_thread(executor.check_position_pnl, pos)
-                symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
-                amount_sol = pos.get("buy_amount_sol", 0)
-                total_invested += amount_sol
-
-                if pnl:
-                    current_val = pnl["current_value_sol"]
-                    pnl_pct = pnl["pnl_pct"]
-                    total_current += current_val
-                    emoji = "🟢" if pnl_pct >= 0 else "🔴"
-                    sign = "+" if pnl_pct >= 0 else ""
-                    lines.append(f"{emoji} ${symbol}: {sign}{pnl_pct:.0f}% ({current_val:.4f} SOL)")
-                else:
-                    lines.append(f"⚪ ${symbol}: N/A")
-                    total_current += amount_sol
-            except Exception:
-                continue
-
-        if total_invested > 0:
-            total_pnl = (total_current - total_invested) / total_invested * 100
-            sign = "+" if total_pnl >= 0 else ""
-            lines.append(f"\nTotal: {sign}{total_pnl:.0f}% | {total_current:.4f} SOL")
+        # -- 15-min live update (open positions only) --
+        open_positions = storage.get_open_positions()
+        if open_positions:
+            lines = ["📊 PORTFOLIO UPDATE\n"]
+            total_in, total_now = 0.0, 0.0
+            for pos in open_positions:
+                try:
+                    pnl = await asyncio.to_thread(executor.check_position_pnl, pos)
+                    sym = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
+                    bought = pos.get("buy_amount_sol", 0)
+                    total_in += bought
+                    if pnl:
+                        cur = pnl["current_value_sol"]
+                        pct = pnl["pnl_pct"]
+                        total_now += cur
+                        e = "🟢" if pct >= 0 else "🔴"
+                        s = "+" if pct >= 0 else ""
+                        lines.append(f"{e} ${sym}: {s}{pct:.0f}% ({cur:.4f} SOL)")
+                    else:
+                        total_now += bought
+                        lines.append(f"⚪ ${sym}: N/A")
+                except Exception:
+                    continue
+            if total_in > 0:
+                total_pct = (total_now - total_in) / total_in * 100
+                s = "+" if total_pct >= 0 else ""
+                lines.append(f"\nTotal: {s}{total_pct:.0f}% | {total_now:.4f} SOL")
             await tg.send_trade_notification("\n".join(lines))
+
+        # -- Daily summary (sent once per day at ~midnight UTC) --
+        day_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        if now_ts - last_daily > 82800 and now_utc.hour == 0:  # within midnight hour
+            last_daily = now_ts
+            closed_today = storage.get_closed_positions_since(day_start)
+            if closed_today:
+                realized = sum((p.get("sell_amount_sol") or 0) - (p.get("buy_amount_sol") or 0)
+                               for p in closed_today)
+                wins = sum(1 for p in closed_today
+                           if (p.get("sell_amount_sol") or 0) > (p.get("buy_amount_sol") or 0))
+                wr = wins / len(closed_today) * 100 if closed_today else 0
+                e = "🟢" if realized >= 0 else "🔴"
+                await tg.send_trade_notification(
+                    f"{e} DAILY SUMMARY\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Trades closed: {len(closed_today)}\n"
+                    f"Win rate: {wr:.0f}%\n"
+                    f"Realized PnL: {'+' if realized >= 0 else ''}{realized:.4f} SOL\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+
+        # -- Weekly summary (Monday at ~midnight UTC) --
+        week_start = (now_ts - now_utc.weekday() * 86400
+                      - now_utc.hour * 3600 - now_utc.minute * 60)
+        if now_ts - last_weekly > 604200 and now_utc.weekday() == 0 and now_utc.hour == 0:
+            last_weekly = now_ts
+            closed_week = storage.get_closed_positions_since(week_start - 7 * 86400)
+            if closed_week:
+                realized = sum((p.get("sell_amount_sol") or 0) - (p.get("buy_amount_sol") or 0)
+                               for p in closed_week)
+                wins = sum(1 for p in closed_week
+                           if (p.get("sell_amount_sol") or 0) > (p.get("buy_amount_sol") or 0))
+                wr = wins / len(closed_week) * 100 if closed_week else 0
+                best = max(closed_week,
+                           key=lambda p: (p.get("sell_amount_sol") or 0) - (p.get("buy_amount_sol") or 0))
+                best_sym = best.get("token_symbol") or best.get("token_address", "")[:8]
+                best_pnl = (best.get("sell_amount_sol") or 0) - (best.get("buy_amount_sol") or 0)
+                e = "🟢" if realized >= 0 else "🔴"
+                await tg.send_trade_notification(
+                    f"{e} WEEKLY SUMMARY\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Trades: {len(closed_week)} | Win rate: {wr:.0f}%\n"
+                    f"Realized PnL: {'+' if realized >= 0 else ''}{realized:.4f} SOL\n"
+                    f"Best trade: ${best_sym} (+{best_pnl:.4f} SOL)\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
 
 
 async def _status_log_loop() -> None:
