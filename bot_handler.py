@@ -1068,18 +1068,26 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
     if bracket_lines:
         lines += ["", "📊 BY SCORE"] + bracket_lines
 
-    # ML training data stats
+    # ML training data + model status
     try:
         import feature_logger
+        import ml_model
         ml = feature_logger.get_feature_stats()
         labeled = ml['labeled']
         remaining = 200 - labeled
-        ready_msg = '✅ Ready for training!' if ml['ready_for_training'] else f'Need {remaining} more labeled samples'
+        model_info = ml_model.get_model_info()
+
+        if model_info["status"] == "active":
+            model_line = f"  Model: ACTIVE ✅ (accuracy {model_info['accuracy']}%)"
+        else:
+            pct = model_info.get("progress_pct", 0)
+            model_line = f"  Model: training data {pct}% ({labeled}/{200} samples)"
+
         lines += [
             "",
             f"🧠 ML DATA: {labeled}/{ml['total']} labeled",
             f"  🌙 moon: {ml['moons']} | 🚀 pump: {ml['pumps']} | ⚪ neutral: {ml['neutrals']} | 📉 dump: {ml['dumps']} | 🚩 rug: {ml['rugs']}",
-            f"  {ready_msg}",
+            model_line,
         ]
     except Exception:
         pass
