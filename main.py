@@ -14,6 +14,7 @@ import config
 import dexscreener_client as dex
 import filters
 import feature_logger
+import ml_model
 import holder_analysis
 import performance_tracker
 import pool_listener
@@ -189,6 +190,27 @@ async def _run_chain_cycle(chain_id: str) -> None:
             safety_data.update(holder_data)
         elif holder_data:
             safety_data = holder_data
+
+        # Get ML pump probability if model is available
+        ml_prob = ml_model.predict_pump({
+            "score_total": result["score"],
+            **result.get("breakdown", {}),
+            "liquidity_usd": (pair.get("liquidity") or {}).get("usd", 0) or 0,
+            "market_cap": pair.get("marketCap") or pair.get("fdv") or 0,
+            "volume_24h": (pair.get("volume") or {}).get("h24", 0) or 0,
+            "volume_1h": (pair.get("volume") or {}).get("h1", 0) or 0,
+            "price_change_5m": (pair.get("priceChange") or {}).get("m5", 0) or 0,
+            "price_change_1h": (pair.get("priceChange") or {}).get("h1", 0) or 0,
+            "price_change_6h": (pair.get("priceChange") or {}).get("h6", 0) or 0,
+            "txns_1h_buys": ((pair.get("txns") or {}).get("h1") or {}).get("buys", 0) or 0,
+            "txns_1h_sells": ((pair.get("txns") or {}).get("h1") or {}).get("sells", 0) or 0,
+            "rugcheck_score": safety_data.get("rugcheck_score") if safety_data else None,
+            "lp_locked_pct": safety_data.get("lp_locked_pct", 0) if safety_data else 0,
+            "risk_count": safety_data.get("risk_count", 0) if safety_data else 0,
+        })
+        if ml_prob is not None:
+            logger.info("[ML] $%s pump probability: %.0f%%", base.get("symbol", "?"), ml_prob * 100)
+            result["ml_prob"] = ml_prob
 
         ok = await tg.send_alert(result, safety=safety_data)
         if ok:
@@ -568,10 +590,13 @@ async def _snapshot_loop() -> None:
             stats = performance_tracker.run_snapshot_check()
             if stats.get("updated") or stats.get("rugged"):
                 logger.info("[SNAPSHOT] %s", stats)
-            # Label ML features periodically
             labeled = feature_logger.label_outcomes()
             if labeled:
                 logger.info("[ML] Labeled %d new outcomes", labeled)
+            # Retrain model if enough data and stale
+            if ml_model.should_retrain():
+                result = ml_model.train()
+                logger.info("[ML] Retrain result: %s", result)
         except Exception:
             logger.exception("[SNAPSHOT] Error in snapshot tracker")
 
