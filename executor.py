@@ -24,13 +24,53 @@ JITO_TIP_LAMPORTS = 10_000  # 0.00001 SOL tip to Jito validator
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
+# -- Daily spend tracking per wallet --
+_daily_spent_sol: float = 0.0
+_daily_reset_time: float = 0.0
+_wallet_index: int = 0  # round-robin index into wallet pool
+
+
+def _get_all_keypairs() -> list:
+    """Load all configured trading wallets. Primary + any in TRADING_WALLET_KEYS."""
+    from solders.keypair import Keypair  # type: ignore
+
+    def _load(key_str: str):
+        if not key_str:
+            return None
+        try:
+            return Keypair.from_base58_string(key_str)
+        except Exception:
+            try:
+                import json
+                return Keypair.from_bytes(bytes(json.loads(key_str)))
+            except Exception as e:
+                logger.warning("Failed to load keypair: %s", e)
+                return None
+
+    keys = []
+    primary = _load(config.TRADING_WALLET_PRIVATE_KEY)
+    if primary:
+        keys.append(primary)
+    for k in config.TRADING_WALLET_KEYS:
+        kp = _load(k)
+        if kp:
+            keys.append(kp)
+    return keys
+
+
+def _get_keypair(index: int = 0):
+    """Get keypair at index from the wallet pool (falls back to 0)."""
+    pool = _get_all_keypairs()
+    if not pool:
+        return None
+    return pool[index % len(pool)]
+
+
 # Cached SOL price
 _sol_price_usd: float = 0.0
 _sol_price_updated: float = 0.0
 
 # Track daily spending
-_daily_spent_sol: float = 0.0
-_daily_reset_time: float = 0.0
 
 
 def get_sol_price() -> float:
@@ -116,11 +156,16 @@ def _get_keypair():
 
 
 def get_wallet_address() -> str | None:
-    """Get the public address of the trading wallet."""
-    kp = _get_keypair()
+    """Get the primary wallet address (shown in /start menu)."""
+    kp = _get_keypair(0)
     if kp is None:
         return None
     return str(kp.pubkey())
+
+
+def get_all_wallet_addresses() -> list[str]:
+    """Get all configured wallet addresses for display."""
+    return [str(kp.pubkey()) for kp in _get_all_keypairs()]
 
 
 def _dynamic_slippage(token_mint: str, amount_sol: float) -> int:
@@ -313,18 +358,23 @@ def get_sell_quote(token_mint: str, token_amount: int) -> dict | None:
 
 
 def execute_swap(quote: dict) -> dict | None:
-    """Execute a swap using a Jupiter quote.
-    
-    Tries Jito bundle first (MEV-protected), falls back to regular RPC.
-    Returns {"signature": str, "status": str} on success, None on failure.
+    """Execute a swap via Jito bundle (MEV-protected), falling back to regular RPC.
+
+    Uses round-robin across the wallet pool to reduce on-chain fingerprinting.
     """
+    global _wallet_index
     from solders.keypair import Keypair  # type: ignore
     from solders.transaction import VersionedTransaction  # type: ignore
 
-    kp = _get_keypair()
-    if kp is None:
+    # Round-robin wallet selection
+    pool = _get_all_keypairs()
+    if not pool:
         logger.error("[TRADE] No trading wallet configured")
         return None
+    kp = pool[_wallet_index % len(pool)]
+    _wallet_index += 1
+    if len(pool) > 1:
+        logger.debug("[TRADE] Using wallet %d/%d for this swap", (_wallet_index - 1) % len(pool) + 1, len(pool))
 
     wallet_address = str(kp.pubkey())
 
