@@ -963,6 +963,71 @@ async def _handle_trade_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("\n".join(lines))
 
 
+async def _handle_pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /pnl — show realized + unrealized PnL summary."""
+    if not update.message:
+        return
+
+    now_ts = time.time()
+    day_start = now_ts - 86400
+    week_start = now_ts - 7 * 86400
+
+    closed_today = storage.get_closed_positions_since(day_start)
+    closed_week = storage.get_closed_positions_since(week_start)
+    open_pos = storage.get_open_positions()
+
+    def _pnl_stats(positions):
+        realized = sum((p.get("sell_amount_sol") or 0) - (p.get("buy_amount_sol") or 0)
+                       for p in positions)
+        wins = sum(1 for p in positions
+                   if (p.get("sell_amount_sol") or 0) > (p.get("buy_amount_sol") or 0))
+        wr = wins / len(positions) * 100 if positions else 0
+        return realized, wr, len(positions)
+
+    r_day, wr_day, n_day = _pnl_stats(closed_today)
+    r_week, wr_week, n_week = _pnl_stats(closed_week)
+
+    lines = ["💰 PnL DASHBOARD\n━━━━━━━━━━━━━━━━━━\n"]
+
+    lines.append(f"📅 Today ({n_day} trades)")
+    s = "+" if r_day >= 0 else ""
+    e = "🟢" if r_day >= 0 else "🔴"
+    lines.append(f"  {e} Realized: {s}{r_day:.4f} SOL | WR: {wr_day:.0f}%")
+
+    lines.append(f"\n📆 Last 7 Days ({n_week} trades)")
+    s = "+" if r_week >= 0 else ""
+    e = "🟢" if r_week >= 0 else "🔴"
+    lines.append(f"  {e} Realized: {s}{r_week:.4f} SOL | WR: {wr_week:.0f}%")
+
+    if open_pos:
+        total_in = sum(p.get("buy_amount_sol", 0) for p in open_pos)
+        lines.append(f"\n📈 Open Positions ({len(open_pos)})")
+        lines.append(f"  Invested: {total_in:.4f} SOL")
+        for p in open_pos:
+            sym = p.get("token_symbol") or p.get("token_address", "")[:8]
+            bought = p.get("buy_amount_sol", 0)
+            pnl = await asyncio.to_thread(executor.check_position_pnl, p)
+            if pnl:
+                s = "+" if pnl["pnl_pct"] >= 0 else ""
+                e = "🟢" if pnl["pnl_pct"] >= 0 else "🔴"
+                lines.append(f"  {e} ${sym}: {s}{pnl['pnl_pct']:.0f}% ({pnl['current_value_sol']:.4f} SOL)")
+            else:
+                lines.append(f"  ⚪ ${sym}: {bought:.4f} SOL (no quote)")
+
+    if closed_week:
+        best = max(closed_week, key=lambda p: (p.get("sell_amount_sol") or 0) - (p.get("buy_amount_sol") or 0))
+        worst = min(closed_week, key=lambda p: (p.get("sell_amount_sol") or 0) - (p.get("buy_amount_sol") or 0))
+        best_sym = best.get("token_symbol") or best.get("token_address", "")[:8]
+        worst_sym = worst.get("token_symbol") or worst.get("token_address", "")[:8]
+        best_pnl = (best.get("sell_amount_sol") or 0) - (best.get("buy_amount_sol") or 0)
+        worst_pnl = (worst.get("sell_amount_sol") or 0) - (worst.get("buy_amount_sol") or 0)
+        lines.append(f"\n🏆 Best (7d): ${best_sym} {'+' if best_pnl >= 0 else ''}{best_pnl:.4f} SOL")
+        lines.append(f"📉 Worst (7d): ${worst_sym} {'+' if worst_pnl >= 0 else ''}{worst_pnl:.4f} SOL")
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /report [days] — send performance report to Telegram."""
     if not update.message:
@@ -1323,6 +1388,7 @@ async def start_bot_handler() -> None:
         BotCommand("trades", "Trade history & status"),
         BotCommand("trade", "Trade detail: /trade <id>"),
         BotCommand("report", "Performance report: /report [days]"),
+        BotCommand("pnl", "PnL dashboard: today, 7d, open positions"),
         BotCommand("buy", "Buy token: /buy <address> $5"),
         BotCommand("sell", "Sell: /sell <id> or /sell all"),
         BotCommand("watch", "Watch token: /watch <address>"),
@@ -1339,6 +1405,7 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("trades", _handle_trades_command))
     app.add_handler(CommandHandler("trade", _handle_trade_command))
     app.add_handler(CommandHandler("report", _handle_report_command))
+    app.add_handler(CommandHandler("pnl", _handle_pnl_command))
     app.add_handler(CommandHandler("buy", _handle_buy_command))
     app.add_handler(CommandHandler("sell", _handle_sell_command))
     app.add_handler(CommandHandler("watch", _handle_watch_command))
