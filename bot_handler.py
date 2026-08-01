@@ -429,25 +429,30 @@ async def _show_trade_detail(query, pos_id: int) -> None:
 
 
 async def _show_wallet(query) -> None:
-    """Show wallet details."""
-    wallet = executor.get_wallet_address()
+    """Show wallet details (all configured wallets when multi-wallet mode active)."""
+    all_wallets = executor.get_all_wallet_addresses()
     balance = executor.get_wallet_balance()
     sol_price = executor.get_sol_price()
 
-    wallet_str = wallet if wallet else "Not configured"
     bal_str = f"{balance['sol']:.4f} SOL (${balance['usd']:.2f})" if balance else "N/A"
 
-    text = (
-        "WALLET\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Address:\n{wallet_str}\n\n"
-        f"Balance: {bal_str}\n"
-        f"SOL Price: ${sol_price:.2f}\n"
-        f"━━━━━━━━━━━━━━━━━━"
-    )
+    lines = [
+        "WALLET\n━━━━━━━━━━━━━━━━━━",
+        f"Balance: {bal_str}",
+        f"SOL Price: ${sol_price:.2f}",
+        "",
+    ]
+    if len(all_wallets) > 1:
+        lines.append(f"Multi-wallet mode ({len(all_wallets)} wallets, round-robin):")
+        for i, addr in enumerate(all_wallets):
+            lines.append(f"  W{i+1}: {addr[:8]}...{addr[-6:]}")
+    else:
+        wallet = all_wallets[0] if all_wallets else "Not configured"
+        lines.append(f"Address:\n{wallet}")
+    lines.append("━━━━━━━━━━━━━━━━━━")
 
     await query.edit_message_text(
-        text,
+        "\n".join(lines),
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("Refresh", callback_data="menu:wallet"),
             InlineKeyboardButton("Back", callback_data="menu:back"),

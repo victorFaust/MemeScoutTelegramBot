@@ -51,6 +51,10 @@ HELIUS_RPC_URL: str = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}
 
 # Trading (Jupiter swap)
 TRADING_WALLET_PRIVATE_KEY: str = os.getenv("TRADING_WALLET_PRIVATE_KEY", "")
+# Additional wallets for multi-wallet execution (optional, comma-separated keys)
+TRADING_WALLET_KEYS: list[str] = [
+    k.strip() for k in os.getenv("TRADING_WALLET_KEYS", "").split(",") if k.strip()
+]
 TRADE_AMOUNT_SOL: float = _float("TRADE_AMOUNT_SOL", 0.1)
 MAX_OPEN_POSITIONS: int = _int("MAX_OPEN_POSITIONS", 5)
 DAILY_LOSS_LIMIT_SOL: float = _float("DAILY_LOSS_LIMIT_SOL", 1.0)
