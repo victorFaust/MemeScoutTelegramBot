@@ -301,11 +301,11 @@ def _parse_helius_swap(tx: dict, wallet_address: str) -> dict | None:
 
 # -- Main Polling Loop --
 
-async def poll_tracked_wallets(on_new_buy) -> None:
-    """Continuously poll tracked wallets for new buys.
+async def poll_tracked_wallets(on_new_buy, on_wallet_sell=None) -> None:
+    """Poll tracked wallets for buys and sells.
 
-    Args:
-        on_new_buy: async callback(wallet_address, token_address, confidence, signature)
+    on_new_buy: async callback(wallet_address, token_address, confidence, signature)
+    on_wallet_sell: async callback(wallet_address, token_address, signature) or None
     """
     if not config.HELIUS_API_KEY:
         logger.warning("[WALLET] No HELIUS_API_KEY -- wallet tracker disabled")
@@ -322,46 +322,53 @@ async def poll_tracked_wallets(on_new_buy) -> None:
 
             for wallet in wallets:
                 address = wallet["address"]
-
                 swaps = await asyncio.to_thread(fetch_recent_swaps, address, 5)
 
                 for swap in swaps:
-                    token = swap.get("token_bought", "")
+                    token_bought = swap.get("token_bought", "")
+                    token_sold = swap.get("token_sold", "")
                     sig = swap.get("signature", "")
 
-                    # Skip sells (token_bought == SOL) and skip SOL itself
-                    if not token or token == SOL_MINT:
+                    # Detect sells: wallet sold a non-SOL token back to SOL
+                    if on_wallet_sell and token_sold and token_sold != SOL_MINT and token_bought == SOL_MINT:
+                        sell_dedup_key = f"sell_{token_sold}"
+                        if not was_buy_already_seen(address, sell_dedup_key):
+                            record_wallet_buy(address, sell_dedup_key, sig, 0)
+                            logger.info("[WALLET] Sell detected: %s exited %s (sig=%s)",
+                                        address[:12], token_sold[:16], sig[:16])
+                            try:
+                                await on_wallet_sell(address, token_sold, sig)
+                            except Exception:
+                                logger.exception("[WALLET] Sell callback error for %s", token_sold[:16])
+
+                    # Detect buys: wallet received a non-SOL token
+                    if not token_bought or token_bought == SOL_MINT:
                         continue
 
-                    # Skip if we already saw this
-                    if was_buy_already_seen(address, token):
+                    # Skip if we already saw this buy
+                    if was_buy_already_seen(address, token_bought):
                         continue
 
-                    # Skip if token was already alerted by our normal flow
-                    if storage.was_recently_alerted("solana", token):
-                        # Still record for confidence tracking
-                        record_wallet_buy(address, token, sig, 1)
+                    # Record for confidence tracking even if already alerted normally
+                    if storage.was_recently_alerted("solana", token_bought):
+                        record_wallet_buy(address, token_bought, sig, 1)
                         continue
 
-                    # Calculate confidence: how many tracked wallets bought this
-                    confidence = get_confidence_for_token(token) + 1
-                    record_wallet_buy(address, token, sig, confidence)
+                    confidence = get_confidence_for_token(token_bought) + 1
+                    record_wallet_buy(address, token_bought, sig, confidence)
 
                     logger.info(
                         "[WALLET] New buy detected: %s bought %s (confidence=%d, sig=%s)",
-                        address[:12], token[:16], confidence, sig[:16]
+                        address[:12], token_bought[:16], confidence, sig[:16]
                     )
 
-                    # Fire callback
                     try:
-                        await on_new_buy(address, token, confidence, sig)
+                        await on_new_buy(address, token_bought, confidence, sig)
                     except Exception:
-                        logger.exception("[WALLET] Callback error for %s", token[:16])
+                        logger.exception("[WALLET] Buy callback error for %s", token_bought[:16])
 
-                # Rate limit: ~200ms between wallets
                 await asyncio.sleep(0.2)
 
-            # Full cycle delay: 8 seconds between complete sweeps
             await asyncio.sleep(8)
 
         except Exception:
