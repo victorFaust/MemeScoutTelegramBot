@@ -49,6 +49,12 @@ SHYFT_HTTP_URL: str = os.getenv("SHYFT_HTTP_URL", "")
 HELIUS_API_KEY: str = os.getenv("HELIUS_API_KEY", "")
 HELIUS_RPC_URL: str = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
 
+# Birdeye API (optional — free public tier works without a key)
+BIRDEYE_API_KEY: str = os.getenv("BIRDEYE_API_KEY", "")
+
+# Solscan API (optional — free public tier works without a key)
+SOLSCAN_API_KEY: str = os.getenv("SOLSCAN_API_KEY", "")
+
 # Trading (Jupiter swap)
 TRADING_WALLET_PRIVATE_KEY: str = os.getenv("TRADING_WALLET_PRIVATE_KEY", "")
 # Additional wallets for multi-wallet execution (optional, comma-separated keys)

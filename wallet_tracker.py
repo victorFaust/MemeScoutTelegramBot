@@ -397,70 +397,114 @@ def seed_default_wallets() -> None:
 
 HELIUS_TOKEN_ACCOUNTS_URL = f"https://api.helius.xyz/v0/token-metadata?api-key={config.HELIUS_API_KEY}"
 HELIUS_SIGNATURES_URL = "https://api.helius.xyz/v0/addresses/{address}/transactions"
+BIRDEYE_TXS_URL = "https://public-api.birdeye.so/defi/txs/token"
+SOLSCAN_TRANSFERS_URL = "https://api.solscan.io/v2/account/transfer"
+
+
+def _get_from_url(url: str, params: dict, headers: dict | None = None, timeout: int = 10) -> requests.Response | None:
+    """GET with 429 awareness — returns None if rate-limited or failed."""
+    try:
+        resp = requests.get(url, params=params, headers=headers or {}, timeout=timeout)
+        if resp.status_code == 429:
+            return None
+        resp.raise_for_status()
+        return resp
+    except Exception:
+        return None
+
+
+def _fetch_early_buyers_helius(token_address: str, limit: int) -> list[str] | None:
+    """Fetch early buyers via Helius. Returns None if rate-limited."""
+    if not config.HELIUS_API_KEY:
+        return None
+    url = HELIUS_SIGNATURES_URL.format(address=token_address)
+    resp = _get_from_url(url, params={"api-key": config.HELIUS_API_KEY, "limit": 100, "type": "SWAP"})
+    if resp is None:
+        return None
+    buyers, seen = [], set()
+    for tx in resp.json():
+        for t in (tx.get("tokenTransfers") or []):
+            if t.get("mint") != token_address:
+                continue
+            addr = t.get("toUserAccount", "")
+            if addr and addr not in seen and addr != token_address:
+                seen.add(addr)
+                buyers.append(addr)
+                if len(buyers) >= limit:
+                    return buyers
+    return buyers
+
+
+def _fetch_early_buyers_birdeye(token_address: str, limit: int) -> list[str] | None:
+    """Fetch early buyers via Birdeye public API. Returns None if rate-limited."""
+    headers = {"x-chain": "solana"}
+    if config.BIRDEYE_API_KEY:
+        headers["X-API-KEY"] = config.BIRDEYE_API_KEY
+    resp = _get_from_url(
+        BIRDEYE_TXS_URL,
+        params={"address": token_address, "tx_type": "swap", "sort_type": "asc", "limit": min(limit * 2, 50)},
+        headers=headers,
+    )
+    if resp is None:
+        return None
+    try:
+        items = resp.json().get("data", {}).get("items") or []
+    except Exception:
+        return None
+    buyers, seen = [], set()
+    for item in items:
+        addr = item.get("owner", "")
+        if addr and addr not in seen:
+            seen.add(addr)
+            buyers.append(addr)
+            if len(buyers) >= limit:
+                break
+    return buyers if buyers else None
+
+
+def _fetch_early_buyers_solscan(token_address: str, limit: int) -> list[str] | None:
+    """Fetch early buyers via Solscan public API. Returns None if rate-limited."""
+    headers = {}
+    if config.SOLSCAN_API_KEY:
+        headers["token"] = config.SOLSCAN_API_KEY
+    resp = _get_from_url(
+        SOLSCAN_TRANSFERS_URL,
+        params={"address": token_address, "activity_type": "ACTIVITY_SPL_TRANSFER", "page": 1, "page_size": min(limit * 2, 40), "sort_by": "block_time", "sort_order": "asc"},
+        headers=headers,
+    )
+    if resp is None:
+        return None
+    try:
+        items = resp.json().get("data") or []
+    except Exception:
+        return None
+    buyers, seen = [], set()
+    for item in items:
+        addr = item.get("to_address", "") or item.get("toAddress", "")
+        if addr and addr not in seen and addr != token_address:
+            seen.add(addr)
+            buyers.append(addr)
+            if len(buyers) >= limit:
+                break
+    return buyers if buyers else None
 
 
 def _fetch_early_buyers(token_address: str, limit: int = 30) -> list[str]:
-    """Fetch the earliest buyer wallets for a token using Helius parsed transactions.
+    """Fetch earliest buyer wallets using Helius → Birdeye → Solscan fallback chain."""
+    for provider_fn, name in [
+        (_fetch_early_buyers_helius, "Helius"),
+        (_fetch_early_buyers_birdeye, "Birdeye"),
+        (_fetch_early_buyers_solscan, "Solscan"),
+    ]:
+        result = provider_fn(token_address, limit)
+        if result is not None:
+            if result:
+                logger.debug("[DISCOVERY] %s: got %d buyers for %s", name, len(result), token_address[:16])
+            return result
+        logger.debug("[DISCOVERY] %s rate-limited for %s, trying next provider", name, token_address[:16])
 
-    Looks at the first swap transactions involving this token and extracts
-    buyer wallet addresses. Includes exponential backoff on 429 rate limits.
-    """
-    if not config.HELIUS_API_KEY:
-        return []
-
-    # Use Helius enhanced transaction history for the token mint
-    url = HELIUS_SIGNATURES_URL.format(address=token_address)
-    
-    # Exponential backoff for 429 (rate limit) errors
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(url, params={
-                "api-key": config.HELIUS_API_KEY,
-                "limit": 100,
-                "type": "SWAP",
-            }, timeout=15)
-            
-            # Handle rate limiting with backoff
-            if resp.status_code == 429:
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # 1s, 2s, 4s
-                    logger.debug("[DISCOVERY] Rate limited (429), waiting %ds before retry %d/%d", wait_time, attempt + 1, max_retries)
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    logger.warning("[DISCOVERY] Rate limited (429) for token %s after %d retries", token_address[:16], max_retries)
-                    return []
-            
-            resp.raise_for_status()
-            txs = resp.json()
-            break
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.warning("[DISCOVERY] Failed to fetch txs for token %s: %s", token_address[:16], e)
-                return []
-            # On other errors, don't retry, just return empty
-            logger.debug("[DISCOVERY] Error fetching token %s (attempt %d): %s", token_address[:16], attempt + 1, e)
-            return []
-
-    buyers = []
-    seen = set()
-
-    for tx in txs:
-        # Look at token transfers to find who received this token (= buyers)
-        token_transfers = tx.get("tokenTransfers") or []
-        for t in token_transfers:
-            mint = t.get("mint", "")
-            if mint != token_address:
-                continue
-            to_addr = t.get("toUserAccount", "")
-            if to_addr and to_addr not in seen and to_addr != token_address:
-                seen.add(to_addr)
-                buyers.append(to_addr)
-                if len(buyers) >= limit:
-                    return buyers
-
-    return buyers
+    logger.warning("[DISCOVERY] All providers failed for token %s", token_address[:16])
+    return []
 
 
 def _score_wallet(wallet_address: str) -> dict | None:
