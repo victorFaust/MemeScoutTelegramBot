@@ -403,24 +403,45 @@ def _fetch_early_buyers(token_address: str, limit: int = 30) -> list[str]:
     """Fetch the earliest buyer wallets for a token using Helius parsed transactions.
 
     Looks at the first swap transactions involving this token and extracts
-    buyer wallet addresses.
+    buyer wallet addresses. Includes exponential backoff on 429 rate limits.
     """
     if not config.HELIUS_API_KEY:
         return []
 
     # Use Helius enhanced transaction history for the token mint
     url = HELIUS_SIGNATURES_URL.format(address=token_address)
-    try:
-        resp = requests.get(url, params={
-            "api-key": config.HELIUS_API_KEY,
-            "limit": 100,
-            "type": "SWAP",
-        }, timeout=15)
-        resp.raise_for_status()
-        txs = resp.json()
-    except Exception as e:
-        logger.warning("[DISCOVERY] Failed to fetch txs for token %s: %s", token_address[:16], e)
-        return []
+    
+    # Exponential backoff for 429 (rate limit) errors
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params={
+                "api-key": config.HELIUS_API_KEY,
+                "limit": 100,
+                "type": "SWAP",
+            }, timeout=15)
+            
+            # Handle rate limiting with backoff
+            if resp.status_code == 429:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # 1s, 2s, 4s
+                    logger.debug("[DISCOVERY] Rate limited (429), waiting %ds before retry %d/%d", wait_time, attempt + 1, max_retries)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.warning("[DISCOVERY] Rate limited (429) for token %s after %d retries", token_address[:16], max_retries)
+                    return []
+            
+            resp.raise_for_status()
+            txs = resp.json()
+            break
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.warning("[DISCOVERY] Failed to fetch txs for token %s: %s", token_address[:16], e)
+                return []
+            # On other errors, don't retry, just return empty
+            logger.debug("[DISCOVERY] Error fetching token %s (attempt %d): %s", token_address[:16], attempt + 1, e)
+            return []
 
     buyers = []
     seen = set()
@@ -563,7 +584,7 @@ def discover_alpha_wallets() -> list[dict]:
         for buyer in buyers:
             wallet_hits.setdefault(buyer, []).append(symbol)
 
-        time.sleep(0.5)  # Rate limit
+        time.sleep(1.5)  # Rate limit (increased from 0.5s)
 
     # Step 3: Filter wallets that appear in 2+ winning tokens
     candidates = {
