@@ -135,26 +135,6 @@ def _reset_daily_if_needed() -> None:
         _daily_reset_time = now
 
 
-def _get_keypair():
-    """Load the trading wallet keypair from env."""
-    from solders.keypair import Keypair  # type: ignore
-
-    key_str = config.TRADING_WALLET_PRIVATE_KEY
-    if not key_str:
-        return None
-    try:
-        # Support both base58 and byte array formats
-        return Keypair.from_base58_string(key_str)
-    except Exception:
-        try:
-            import json
-            key_bytes = bytes(json.loads(key_str))
-            return Keypair.from_bytes(key_bytes)
-        except Exception as e:
-            logger.error("Failed to load trading wallet keypair: %s", e)
-            return None
-
-
 def get_wallet_address() -> str | None:
     """Get the primary wallet address (shown in /start menu)."""
     kp = _get_keypair(0)
