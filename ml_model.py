@@ -67,12 +67,23 @@ def train() -> dict:
         return {"status": "insufficient_data", "samples": len(rows)}
 
     # Binary target: pump/moon = 1, else = 0
+    # Exclude rug-only samples for training — keep dump/neutral as negative class
+    rows = [r for r in rows if r.get("outcome_label") != "rug"]
+    if len(rows) < MIN_SAMPLES:
+        logger.info("[ML] Only %d non-rug samples after filtering, need %d -- skipping", len(rows), MIN_SAMPLES)
+        return {"status": "insufficient_data", "samples": len(rows)}
+
     X = [_to_row(r) for r in rows]
     y = [1 if r.get("outcome_label") in ("moon", "pump") else 0 for r in rows]
 
     import numpy as np
     X_arr = np.array(X, dtype=float)
     y_arr = np.array(y)
+
+    # Reject degenerate dataset (all one class)
+    if len(set(y_arr)) < 2:
+        logger.warning("[ML] Dataset is single-class (%s only) -- cannot train useful model", rows[0].get("outcome_label"))
+        return {"status": "degenerate_dataset", "samples": len(rows)}
 
     # Replace NaN/inf
     X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
@@ -129,8 +140,17 @@ def load_model() -> bool:
     try:
         with open(MODEL_PATH, "rb") as f:
             data = pickle.load(f)
+        
+        # Reject stale models trained on degenerate data (100% accuracy = all-one-class)
+        acc = data.get("accuracy", 0)
+        pump_rate = data.get("pump_rate", None)
+        if acc >= 0.99 and (pump_rate is None or pump_rate == 0):
+            logger.warning("[ML] Discarding stale model (100%% accuracy, 0%% pump rate -- trained on rug-only data)")
+            MODEL_PATH.unlink(missing_ok=True)
+            return False
+
         _model = data["model"]
-        _model_accuracy = data.get("accuracy", 0)
+        _model_accuracy = acc
         _model_loaded_at = data.get("trained_at", 0)
         logger.info("[ML] Model loaded from disk (accuracy=%.1f%%)", _model_accuracy * 100)
         return True
