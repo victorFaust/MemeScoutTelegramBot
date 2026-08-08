@@ -55,33 +55,21 @@ def _get_current_price(chain_id: str, pair_address: str) -> float | None:
     return None
 
 
-# Track consecutive misses per pair before declaring rug
-_rug_miss_counts: dict[str, int] = {}
-_RUG_CONFIRM_THRESHOLD = 3  # require 3 consecutive empty/zero-liq responses
-
-
 def _is_rugged(chain_id: str, pair_address: str) -> bool:
-    """Check if a token is rugged. Requires 3 consecutive failed lookups to confirm."""
+    """Check if a token appears to be rugged (no data or zero liquidity)."""
     pairs = dex.get_token_pairs(chain_id, pair_address)
     if not pairs:
         pairs = dex.fetch_pair_details(chain_id, pair_address)
 
-    has_liquidity = False
-    if pairs:
-        for p in pairs:
-            liq = (p.get("liquidity") or {}).get("usd", 0)
-            if liq and float(liq) > 100:  # must have at least $100 liquidity
-                has_liquidity = True
-                break
+    if not pairs:
+        return True
 
-    key = f"{chain_id}:{pair_address}"
-    if has_liquidity:
-        _rug_miss_counts.pop(key, None)
-        return False
+    for p in pairs:
+        liq = (p.get("liquidity") or {}).get("usd", 0)
+        if liq and float(liq) > 100:
+            return False
 
-    # Increment miss counter — only declare rug after threshold
-    _rug_miss_counts[key] = _rug_miss_counts.get(key, 0) + 1
-    return _rug_miss_counts[key] >= _RUG_CONFIRM_THRESHOLD
+    return True
 
 
 def run_snapshot_check() -> dict[str, int]:
