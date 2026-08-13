@@ -75,6 +75,21 @@ def get_token_pairs(chain_id: str, token_address: str) -> list[dict]:
     return []
 
 
+def get_pair(chain_id: str, pair_address: str) -> list[dict] | None:
+    """Get a pair by pair address.
+
+    ``None`` means the request failed; an empty list is a successful lookup with
+    no matching pair. Keeping those states separate prevents transient API
+    failures from being recorded as rugs.
+    """
+    data = _get(f"{BASE}/latest/dex/pairs/{chain_id}/{pair_address}")
+    if data is None:
+        return None
+    if isinstance(data, dict):
+        return data.get("pairs") or ([] if data.get("pair") is None else [data["pair"]])
+    return []
+
+
 def search_pairs(query: str) -> list[dict]:
     """Search for pairs by token name/symbol/address."""
     data = _get(f"{BASE}/latest/dex/search", params={"q": query})

@@ -311,6 +311,10 @@ def get_feature_stats() -> dict:
         neutrals = conn.execute("SELECT COUNT(*) FROM ml_features WHERE outcome_label = 'neutral'").fetchone()[0]
         dumps = conn.execute("SELECT COUNT(*) FROM ml_features WHERE outcome_label = 'dump'").fetchone()[0]
         rugs = conn.execute("SELECT COUNT(*) FROM ml_features WHERE outcome_label = 'rug'").fetchone()[0]
+        usable = conn.execute(
+            "SELECT COUNT(*) FROM ml_features WHERE outcome_label IS NOT NULL "
+            "AND outcome_label NOT IN ('rug', 'invalid')"
+        ).fetchone()[0]
         return {
             "total": total,
             "labeled": labeled,
@@ -319,7 +323,8 @@ def get_feature_stats() -> dict:
             "neutrals": neutrals,
             "dumps": dumps,
             "rugs": rugs,
-            "ready_for_training": labeled >= 200,
+            "usable_labeled": usable,
+            "ready_for_training": usable >= 200,
         }
     finally:
         conn.close()

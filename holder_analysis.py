@@ -156,7 +156,9 @@ def get_unique_buyers_recent(token_mint: str, limit: int = 20) -> dict | None:
     return {
         "unique_buyers": len(buyers),
         "unique_sellers": len(sellers),
-        "total_txns": len(sigs_result),
+        # Only successfully fetched transactions are valid evidence. RPC
+        # failures must not be counted as non-unique buyers.
+        "total_txns": checked,
         "tx_count_checked": checked,
     }
 
