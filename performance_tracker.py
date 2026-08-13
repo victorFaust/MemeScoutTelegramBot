@@ -23,14 +23,15 @@ WINDOWS = [
 
 # Grace period: don't check until at least this many seconds after the due time
 _GRACE_SECONDS = 60
+_RUG_CONFIRM_THRESHOLD = 3
+_rug_miss_counts: dict[str, int] = {}
 
 
 def _get_current_price(chain_id: str, pair_address: str) -> float | None:
     """Fetch current price for a pair from DexScreener. Returns None if unavailable."""
-    pairs = dex.get_token_pairs(chain_id, pair_address)
-    if not pairs:
-        # Try fetching by pair address directly
-        pairs = dex.fetch_pair_details(chain_id, pair_address)
+    pairs = dex.get_pair(chain_id, pair_address)
+    if pairs is None:
+        return None
 
     for p in pairs:
         if p.get("pairAddress", "").lower() == pair_address.lower():
@@ -55,21 +56,20 @@ def _get_current_price(chain_id: str, pair_address: str) -> float | None:
     return None
 
 
-def _is_rugged(chain_id: str, pair_address: str) -> bool:
-    """Check if a token appears to be rugged (no data or zero liquidity)."""
-    pairs = dex.get_token_pairs(chain_id, pair_address)
-    if not pairs:
-        pairs = dex.fetch_pair_details(chain_id, pair_address)
-
-    if not pairs:
-        return True
+def _rug_status(chain_id: str, pair_address: str) -> bool | None:
+    """Return True for a confirmed rug, False for liquid, None if inconclusive."""
+    pairs = dex.get_pair(chain_id, pair_address)
+    if pairs is None:
+        return None
 
     for p in pairs:
         liq = (p.get("liquidity") or {}).get("usd", 0)
         if liq and float(liq) > 100:
+            _rug_miss_counts.pop(f"{chain_id}:{pair_address}", None)
             return False
-
-    return True
+    key = f"{chain_id}:{pair_address}"
+    _rug_miss_counts[key] = _rug_miss_counts.get(key, 0) + 1
+    return True if _rug_miss_counts[key] >= _RUG_CONFIRM_THRESHOLD else None
 
 
 def run_snapshot_check() -> dict[str, int]:
@@ -104,7 +104,8 @@ def run_snapshot_check() -> dict[str, int]:
 
         try:
             # Check for rug first
-            if _is_rugged(chain_id, pair_address):
+            rug_status = _rug_status(chain_id, pair_address)
+            if rug_status is True:
                 logger.info("Token %s on %s appears rugged", row.get("token_symbol", "?"), chain_id)
                 storage.update_snapshot(row_id, "", None, rugged=True)
                 try:
@@ -113,6 +114,10 @@ def run_snapshot_check() -> dict[str, int]:
                 except Exception:
                     pass
                 stats["rugged"] += 1
+                continue
+            if rug_status is None:
+                logger.info("Rug status inconclusive for %s; will retry", row.get("token_symbol", "?"))
+                stats["errors"] += 1
                 continue
 
             # Fetch current price

@@ -1144,14 +1144,14 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
         import ml_model
         ml = feature_logger.get_feature_stats()
         labeled = ml['labeled']
-        remaining = 200 - labeled
+        usable = ml.get('usable_labeled', labeled - ml['rugs'])
         model_info = ml_model.get_model_info()
 
         if model_info["status"] == "active":
             model_line = f"  Model: ACTIVE ✅ (accuracy {model_info['accuracy']}%)"
         else:
-            pct = model_info.get("progress_pct", 0)
-            model_line = f"  Model: training data {pct}% ({labeled}/{200} samples)"
+            pct = min(100, model_info.get("progress_pct", 0))
+            model_line = f"  Model: training data {pct}% ({usable}/{200} usable samples)"
 
         lines += [
             "",
@@ -1159,6 +1159,8 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
             f"  🌙 moon: {ml['moons']} | 🚀 pump: {ml['pumps']} | ⚪ neutral: {ml['neutrals']} | 📉 dump: {ml['dumps']} | 🚩 rug: {ml['rugs']}",
             model_line,
         ]
+        if ml['rugs'] and usable == 0:
+            lines.append("  ⚠️ Historical rug-only labels are excluded from training")
     except Exception:
         pass
 

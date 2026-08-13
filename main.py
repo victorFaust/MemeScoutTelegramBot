@@ -62,6 +62,7 @@ _CHAIN_PRIORITY: dict[str, int] = {
 
 # Per-chain last-run tracking
 _chain_last_run: dict[str, float] = {}
+_pool_alert_times: deque = deque()
 
 
 def _purge_old_calls() -> None:
@@ -251,6 +252,15 @@ async def _handle_new_pool(token_info: dict) -> None:
     token_address = token_info["token_address"]
     chain_id = token_info["chain_id"]
     symbol = token_info.get("symbol", "???")
+    cfg = config.get_chain_profile(chain_id)
+
+    cutoff = time.time() - 3600
+    while _pool_alert_times and _pool_alert_times[0] < cutoff:
+        _pool_alert_times.popleft()
+    if len(_pool_alert_times) >= config.POOL_ALERT_MAX_PER_HOUR:
+        logger.warning("[POOL] Hourly alert cap reached (%d); skipping $%s",
+                       config.POOL_ALERT_MAX_PER_HOUR, symbol)
+        return
 
     # Dedup
     if storage.was_recently_alerted(chain_id, token_address):
@@ -283,8 +293,10 @@ async def _handle_new_pool(token_info: dict) -> None:
     buys = txns.get("buys", 0) or 0
     total_txns = buys + (txns.get("sells", 0) or 0)
 
-    if total_txns < 3:
-        logger.debug("[POOL] $%s -- only %d txns after 60s, skipping", symbol, total_txns)
+    min_pool_txns = cfg.get("min_pool_txns_1h", 25)
+    if total_txns < min_pool_txns:
+        logger.debug("[POOL] $%s -- only %d txns after 60s (need %d), skipping",
+                     symbol, total_txns, min_pool_txns)
         return
 
     # Build alert data
@@ -298,7 +310,6 @@ async def _handle_new_pool(token_info: dict) -> None:
         token_info["symbol"] = base_token["symbol"]
 
     # Holder analysis + serial deployer check
-    cfg = config.get_chain_profile(chain_id)
     holder_pass, holder_data = await asyncio.to_thread(
         holder_analysis.passes_holder_checks, token_address, cfg
     )
@@ -315,6 +326,7 @@ async def _handle_new_pool(token_info: dict) -> None:
     # Send alert
     ok = await tg.send_new_pool_alert(token_info, rc_data)
     if ok:
+        _pool_alert_times.append(time.time())
         storage.record_alert(chain_id, token_address, 0)
         logger.info("[POOL] Alert sent: $%s (%s) | %d txns",
                     token_info["symbol"], token_address[:16], total_txns)

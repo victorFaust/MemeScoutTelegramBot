@@ -68,7 +68,7 @@ def train() -> dict:
 
     # Binary target: pump/moon = 1, else = 0
     # Exclude rug-only samples for training — keep dump/neutral as negative class
-    rows = [r for r in rows if r.get("outcome_label") != "rug"]
+    rows = [r for r in rows if r.get("outcome_label") not in ("rug", "invalid")]
     if len(rows) < MIN_SAMPLES:
         logger.info("[ML] Only %d non-rug samples after filtering, need %d -- skipping", len(rows), MIN_SAMPLES)
         return {"status": "insufficient_data", "samples": len(rows)}
@@ -187,7 +187,7 @@ def should_retrain() -> bool:
     if _model is None and not MODEL_PATH.exists():
         import feature_logger
         stats = feature_logger.get_feature_stats()
-        return stats.get("labeled", 0) >= MIN_SAMPLES
+        return stats.get("usable_labeled", 0) >= MIN_SAMPLES
     if time.time() - _last_train_attempt > RETRAIN_INTERVAL:
         return True
     return False
@@ -198,7 +198,7 @@ def get_model_info() -> dict:
     if _model is None and not MODEL_PATH.exists():
         import feature_logger
         stats = feature_logger.get_feature_stats()
-        labeled = stats.get("labeled", 0)
+        labeled = stats.get("usable_labeled", 0)
         return {
             "status": "not_trained",
             "labeled_samples": labeled,
