@@ -10,6 +10,7 @@ Wallet list stored in SQLite for persistence and stats tracking.
 """
 
 import asyncio
+import json
 import logging
 import sqlite3
 import time
@@ -26,6 +27,10 @@ logger = logging.getLogger(__name__)
 _fetch_warning_at: dict[str, float] = {}
 _FETCH_WARNING_INTERVAL = 300
 _last_wallet_signature: dict[str, str] = {}
+_stream_health: dict[str, Any] = {
+    "mode": "starting", "connected": False, "subscriptions": 0,
+    "last_event_at": 0.0, "last_latency_ms": None, "reconnects": 0,
+}
 
 # Known DEX program IDs (to identify swaps)
 JUPITER_PROGRAMS = {
@@ -299,77 +304,160 @@ def _parse_rpc_swap(tx: dict, wallet_address: str, signature: str = "") -> dict 
     return None
 
 
-# -- Main Polling Loop --
+# -- Event-driven tracker with polling fallback --
+
+def get_tracker_health() -> dict[str, Any]:
+    return dict(_stream_health)
+
+
+async def _dispatch_swap(address: str, swap: dict, on_new_buy, on_wallet_sell=None) -> None:
+    token_bought = swap.get("token_bought", "")
+    token_sold = swap.get("token_sold", "")
+    sig = swap.get("signature", "")
+
+    if on_wallet_sell and token_sold and token_sold != SOL_MINT and token_bought == SOL_MINT:
+        sell_key = f"sell_{token_sold}"
+        if not was_buy_already_seen(address, sell_key):
+            record_wallet_buy(address, sell_key, sig, 0)
+            logger.info("[WALLET] Sell detected: %s exited %s (sig=%s)", address[:12], token_sold[:16], sig[:16])
+            try:
+                await on_wallet_sell(address, token_sold, sig)
+            except Exception:
+                logger.exception("[WALLET] Sell callback error for %s", token_sold[:16])
+
+    if not token_bought or token_bought == SOL_MINT or was_buy_already_seen(address, token_bought):
+        return
+    if storage.was_recently_alerted("solana", token_bought):
+        record_wallet_buy(address, token_bought, sig, 1)
+        return
+
+    confidence = get_confidence_for_token(token_bought) + 1
+    record_wallet_buy(address, token_bought, sig, confidence)
+    logger.info("[WALLET] New buy detected: %s bought %s (confidence=%d, sig=%s)",
+                address[:12], token_bought[:16], confidence, sig[:16])
+    try:
+        await on_new_buy(address, token_bought, confidence, sig)
+    except Exception:
+        logger.exception("[WALLET] Buy callback error for %s", token_bought[:16])
+
+
+async def _poll_wallets_once(on_new_buy, on_wallet_sell=None) -> None:
+    _stream_health.update(mode="polling_fallback", connected=False)
+    for wallet in get_tracked_wallets():
+        address = wallet["address"]
+        swaps = await asyncio.to_thread(fetch_recent_swaps, address, 5)
+        for swap in swaps:
+            await _dispatch_swap(address, swap, on_new_buy, on_wallet_sell)
+        await asyncio.sleep(0.2)
+
+
+async def _fetch_stream_transaction(address: str, signature: str) -> dict | None:
+    """Fetch a just-notified transaction, allowing RPC indexing a few seconds."""
+    for delay in (0.0, 0.4, 1.0, 2.0):
+        if delay:
+            await asyncio.sleep(delay)
+        tx = await asyncio.to_thread(
+            rpc_client.rpc_call, "getTransaction",
+            [signature, {"encoding": "jsonParsed", "commitment": "confirmed",
+                         "maxSupportedTransactionVersion": 0}],
+            None, "Alchemy",
+        )
+        if tx is not None:
+            return _parse_rpc_swap(tx, address, signature)
+    return None
+
+
+async def _stream_wallets(on_new_buy, on_wallet_sell=None) -> None:
+    """Subscribe to tracked-wallet transaction logs until reconnect is required."""
+    import websockets
+
+    wallets = get_tracked_wallets()
+    if not wallets:
+        _stream_health.update(mode="idle", connected=False, subscriptions=0)
+        await asyncio.sleep(30)
+        return
+
+    async with websockets.connect(config.ALCHEMY_WSS_URL, ping_interval=20, ping_timeout=20,
+                                  close_timeout=5, max_queue=1000) as websocket:
+        request_to_wallet: dict[int, str] = {}
+        subscription_to_wallet: dict[int, str] = {}
+        for request_id, wallet in enumerate(wallets, 1):
+            address = wallet["address"]
+            request_to_wallet[request_id] = address
+            await websocket.send(json.dumps({
+                "jsonrpc": "2.0", "id": request_id, "method": "logsSubscribe",
+                "params": [{"mentions": [address]}, {"commitment": "confirmed"}],
+            }))
+
+        _stream_health.update(mode="websocket", connected=True, subscriptions=0)
+        logger.info("[WALLET] Alchemy stream connected; subscribing to %d wallet(s)", len(wallets))
+        subscribed_addresses: set[str] = set()
+        while True:
+            try:
+                raw = await asyncio.wait_for(websocket.recv(), timeout=30)
+            except asyncio.TimeoutError:
+                current_addresses = {wallet["address"] for wallet in get_tracked_wallets()}
+                if current_addresses != set(request_to_wallet.values()):
+                    logger.info("[WALLET] Tracked wallet set changed; refreshing stream subscriptions")
+                    return
+                continue
+            received_at = time.time()
+            message = json.loads(raw)
+            if "id" in message and "error" in message:
+                raise RuntimeError(f"subscription rejected: {message['error']}")
+            if "id" in message and "result" in message:
+                address = request_to_wallet.get(int(message["id"]))
+                if address:
+                    subscription_to_wallet[int(message["result"])] = address
+                    subscribed_addresses.add(address)
+                    _stream_health["subscriptions"] = len(subscription_to_wallet)
+                continue
+            params = message.get("params") or {}
+            if params.get("subscription") is None:
+                continue
+            address = subscription_to_wallet.get(int(params["subscription"]))
+            value = ((params.get("result") or {}).get("value") or {})
+            signature = value.get("signature", "")
+            if not address or not signature or value.get("err"):
+                continue
+            started = time.time()
+            swap = await _fetch_stream_transaction(address, signature)
+            if swap:
+                await _dispatch_swap(address, swap, on_new_buy, on_wallet_sell)
+            _stream_health.update(
+                last_event_at=received_at,
+                last_latency_ms=round((time.time() - started) * 1000),
+            )
+            current_addresses = {wallet["address"] for wallet in get_tracked_wallets()}
+            if current_addresses != subscribed_addresses:
+                logger.info("[WALLET] Tracked wallet set changed; refreshing stream subscriptions")
+                return
+
 
 async def poll_tracked_wallets(on_new_buy, on_wallet_sell=None) -> None:
-    """Poll tracked wallets for buys and sells.
-
-    on_new_buy: async callback(wallet_address, token_address, confidence, signature)
-    on_wallet_sell: async callback(wallet_address, token_address, signature) or None
-    """
+    """Use Alchemy streaming when configured, with RPC polling on every outage."""
     logger.info("[WALLET] Tracker started with %d wallets", get_wallet_count())
-
+    backoff = 2
     while True:
-        try:
-            wallets = get_tracked_wallets()
-            if not wallets:
-                await asyncio.sleep(30)
-                continue
-
-            for wallet in wallets:
-                address = wallet["address"]
-                swaps = await asyncio.to_thread(fetch_recent_swaps, address, 5)
-
-                for swap in swaps:
-                    token_bought = swap.get("token_bought", "")
-                    token_sold = swap.get("token_sold", "")
-                    sig = swap.get("signature", "")
-
-                    # Detect sells: wallet sold a non-SOL token back to SOL
-                    if on_wallet_sell and token_sold and token_sold != SOL_MINT and token_bought == SOL_MINT:
-                        sell_dedup_key = f"sell_{token_sold}"
-                        if not was_buy_already_seen(address, sell_dedup_key):
-                            record_wallet_buy(address, sell_dedup_key, sig, 0)
-                            logger.info("[WALLET] Sell detected: %s exited %s (sig=%s)",
-                                        address[:12], token_sold[:16], sig[:16])
-                            try:
-                                await on_wallet_sell(address, token_sold, sig)
-                            except Exception:
-                                logger.exception("[WALLET] Sell callback error for %s", token_sold[:16])
-
-                    # Detect buys: wallet received a non-SOL token
-                    if not token_bought or token_bought == SOL_MINT:
-                        continue
-
-                    # Skip if we already saw this buy
-                    if was_buy_already_seen(address, token_bought):
-                        continue
-
-                    # Record for confidence tracking even if already alerted normally
-                    if storage.was_recently_alerted("solana", token_bought):
-                        record_wallet_buy(address, token_bought, sig, 1)
-                        continue
-
-                    confidence = get_confidence_for_token(token_bought) + 1
-                    record_wallet_buy(address, token_bought, sig, confidence)
-
-                    logger.info(
-                        "[WALLET] New buy detected: %s bought %s (confidence=%d, sig=%s)",
-                        address[:12], token_bought[:16], confidence, sig[:16]
-                    )
-
-                    try:
-                        await on_new_buy(address, token_bought, confidence, sig)
-                    except Exception:
-                        logger.exception("[WALLET] Buy callback error for %s", token_bought[:16])
-
-                await asyncio.sleep(0.2)
-
+        if not config.ALCHEMY_WSS_URL:
+            await _poll_wallets_once(on_new_buy, on_wallet_sell)
             await asyncio.sleep(8)
-
-        except Exception:
-            logger.exception("[WALLET] Error in polling loop")
-            await asyncio.sleep(15)
+            continue
+        try:
+            await _stream_wallets(on_new_buy, on_wallet_sell)
+            backoff = 2
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _stream_health.update(mode="polling_fallback", connected=False,
+                                  reconnects=int(_stream_health["reconnects"]) + 1)
+            logger.warning("[WALLET] Stream unavailable (%s); running polling fallback", exc)
+            try:
+                await _poll_wallets_once(on_new_buy, on_wallet_sell)
+            except Exception:
+                logger.exception("[WALLET] Polling fallback failed")
+            await asyncio.sleep(backoff)
+            backoff = min(30, backoff * 2)
 
 
 # -- Seed wallets (call once to populate initial list) --

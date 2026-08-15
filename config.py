@@ -52,6 +52,10 @@ ALCHEMY_RPC_URL: str = (
     f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
     if ALCHEMY_API_KEY else ""
 )
+ALCHEMY_WSS_URL: str = (
+    f"wss://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+    if ALCHEMY_API_KEY else ""
+)
 
 # Birdeye API (optional — free public tier works without a key)
 BIRDEYE_API_KEY: str = os.getenv("BIRDEYE_API_KEY", "")
