@@ -40,7 +40,6 @@ class _SecretFilter(logging.Filter):
         message = self._QUERY_SECRET.sub(r"\1=[REDACTED]", message)
         for secret in (
             config.TELEGRAM_BOT_TOKEN,
-            config.HELIUS_API_KEY,
             config.BIRDEYE_API_KEY,
             config.SOLSCAN_API_KEY,
             config.QUICKNODE_HTTP_URL,
