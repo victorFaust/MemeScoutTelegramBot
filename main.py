@@ -988,8 +988,9 @@ async def _tx_confirmation_loop() -> None:
     while True:
         await asyncio.sleep(10)
         try:
-            pending = storage.get_pending_positions()
+            pending = storage.get_positions_needing_confirmation()
             if not pending:
+                await _reconcile_open_positions()
                 continue
 
             for pos in pending:
@@ -1005,6 +1006,12 @@ async def _tx_confirmation_loop() -> None:
                 status = await asyncio.to_thread(executor.confirm_transaction, sig)
 
                 if status in ("confirmed", "finalized"):
+                    wallet = pos.get("wallet_address") or executor.get_wallet_address() or ""
+                    actual_delta = await asyncio.to_thread(
+                        executor.get_confirmed_token_delta, sig, wallet, pos.get("token_address", "")
+                    )
+                    if actual_delta is not None and actual_delta > 0:
+                        storage.reconcile_position(pos_id, actual_delta, "confirmed", update_token_amount=True)
                     storage.update_tx_status(pos_id, status)
                     symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
                     logger.info("[TX] Position #%d ($%s) confirmed: %s", pos_id, symbol, status)
@@ -1025,21 +1032,77 @@ async def _tx_confirmation_loop() -> None:
                         f"Your buy transaction failed on-chain.\n"
                         f"Sig: {sig[:20]}..."
                     )
-                elif age_seconds > 90 and status == "not_found":
-                    # Don't close position — tx may have succeeded but RPC can't find it
-                    # The tokens are in the wallet, so keep the position open
+                elif age_seconds > 90 and status == "not_found" and pos.get("tx_status") == "pending":
+                    # Keep retrying: RPC indexing can lag, especially after provider failover.
                     storage.update_tx_status(pos_id, "unconfirmed")
                     symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
                     logger.warning("[TX] Position #%d ($%s) unconfirmed after %.0fs (keeping open)", pos_id, symbol, age_seconds)
                     await tg.send_trade_notification(
                         f"⚠️ TX UNCONFIRMED ${symbol}\n"
-                        f"Could not confirm after 90s but position kept open.\n"
+                        f"Could not confirm after 90s; reconciliation will keep retrying.\n"
                         f"Check: solscan.io/tx/{sig}"
                     )
+                elif age_seconds > 600 and status == "not_found":
+                    wallet = pos.get("wallet_address") or executor.get_wallet_address() or ""
+                    balance = await asyncio.to_thread(
+                        executor.get_token_balance, wallet, pos.get("token_address", "")
+                    )
+                    if balance is not None and balance > 0:
+                        storage.reconcile_position(pos_id, balance, "wallet_balance_seen")
+                    elif balance == 0:
+                        storage.update_tx_status(pos_id, "dropped")
+                        storage.close_position(pos_id, 0, sig)
+                        symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
+                        logger.warning("[TX] Position #%d ($%s) dropped after 10m with zero balance", pos_id, symbol)
+                        await tg.send_trade_notification(
+                            f"TX DROPPED ${symbol}\nNo confirmation or wallet balance was found after 10 minutes."
+                        )
                 # else: still pending, wait more
+
+            await _reconcile_open_positions()
 
         except Exception:
             logger.exception("[TX] Error in confirmation loop")
+
+
+_last_position_reconciliation = 0.0
+
+
+async def _reconcile_open_positions(force: bool = False) -> None:
+    """Record observed token balances without silently rewriting trade history."""
+    import executor
+
+    global _last_position_reconciliation
+    now = time.time()
+    if not force and now - _last_position_reconciliation < 60:
+        return
+    _last_position_reconciliation = now
+
+    positions = storage.get_open_positions()
+    ownership_counts: dict[tuple[str, str], int] = {}
+    for pos in positions:
+        wallet = pos.get("wallet_address") or executor.get_wallet_address() or ""
+        key = (wallet, pos.get("token_address", ""))
+        ownership_counts[key] = ownership_counts.get(key, 0) + 1
+
+    for pos in positions:
+        if pos.get("tx_status") in {"pending", "unconfirmed"}:
+            continue
+        wallet = pos.get("wallet_address") or executor.get_wallet_address() or ""
+        mint = pos.get("token_address", "")
+        if not wallet or not mint:
+            continue
+        balance = await asyncio.to_thread(executor.get_token_balance, wallet, mint)
+        if balance is None:
+            storage.reconcile_position(pos["id"], 0, "rpc_unavailable")
+        elif ownership_counts[(wallet, mint)] > 1:
+            storage.reconcile_position(pos["id"], balance, "aggregate_balance")
+        elif balance == 0:
+            storage.reconcile_position(pos["id"], 0, "balance_missing")
+        elif balance != int(pos.get("token_amount") or 0):
+            storage.reconcile_position(pos["id"], balance, "balance_mismatch")
+        else:
+            storage.reconcile_position(pos["id"], balance, "matched")
 
 
 # -- Entry point --
