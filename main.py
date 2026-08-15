@@ -44,6 +44,8 @@ class _SecretFilter(logging.Filter):
             config.SOLSCAN_API_KEY,
             config.QUICKNODE_HTTP_URL,
             config.SHYFT_HTTP_URL,
+            config.ALCHEMY_API_KEY,
+            config.ALCHEMY_RPC_URL,
         ):
             if secret:
                 message = message.replace(secret, "[REDACTED]")

@@ -46,6 +46,13 @@ QUICKNODE_HTTP_URL: str = os.getenv("QUICKNODE_HTTP_URL", "")
 # Shyft Solana
 SHYFT_HTTP_URL: str = os.getenv("SHYFT_HTTP_URL", "")
 
+# Alchemy Solana (primary wallet tracker RPC)
+ALCHEMY_API_KEY: str = os.getenv("ALCHEMY_API_KEY", "")
+ALCHEMY_RPC_URL: str = (
+    f"https://solana-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+    if ALCHEMY_API_KEY else ""
+)
+
 # Birdeye API (optional — free public tier works without a key)
 BIRDEYE_API_KEY: str = os.getenv("BIRDEYE_API_KEY", "")
 

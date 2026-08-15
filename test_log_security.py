@@ -2,9 +2,10 @@
 
 import logging
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import main
+import rpc_client
 import wallet_tracker
 
 
@@ -66,6 +67,32 @@ class WalletRpcTests(unittest.TestCase):
             wallet_tracker.fetch_recent_swaps("wallet-address")
         text = " ".join(logs.output)
         self.assertEqual(text.count("All RPC providers failed"), 1)
+
+
+class AlchemyProviderTests(unittest.TestCase):
+    def setUp(self):
+        rpc_client._initialized = False
+        rpc_client._providers = []
+        rpc_client._provider_cooldowns.clear()
+        rpc_client._current_index = 0
+
+    @patch("rpc_client.requests.post")
+    @patch("rpc_client.config.ALCHEMY_RPC_URL", "https://solana-mainnet.g.alchemy.com/v2/test")
+    @patch("rpc_client.config.QUICKNODE_HTTP_URL", "https://quicknode.test")
+    @patch("rpc_client.config.SHYFT_HTTP_URL", "")
+    def test_alchemy_is_preferred_for_wallet_calls(self, request_post):
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"result": []}
+        request_post.return_value = response
+        result = rpc_client.rpc_call(
+            "getSignaturesForAddress", ["wallet"], preferred_name="Alchemy"
+        )
+        self.assertEqual(result, [])
+        self.assertEqual(
+            request_post.call_args.args[0],
+            "https://solana-mainnet.g.alchemy.com/v2/test",
+        )
 
 
 if __name__ == "__main__":
