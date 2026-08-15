@@ -686,17 +686,16 @@ def confirm_transaction(signature: str) -> str:
 
     Returns one of: 'confirmed', 'finalized', 'failed', 'not_found', 'error'.
     """
-    rpc_url = config.QUICKNODE_HTTP_URL or "https://api.mainnet-beta.solana.com"
     try:
-        resp = requests.post(rpc_url, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignatureStatuses",
-            "params": [[signature], {"searchTransactionHistory": True}],
-        }, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        statuses = data.get("result", {}).get("value", [])
+        import rpc_client
+        result = rpc_client.rpc_call(
+            "getSignatureStatuses",
+            [[signature], {"searchTransactionHistory": True}],
+            preferred_name="Alchemy",
+        )
+        if result is None:
+            return "error"
+        statuses = result.get("value", [])
         if not statuses or statuses[0] is None:
             return "not_found"
         status = statuses[0]
@@ -709,3 +708,54 @@ def confirm_transaction(signature: str) -> str:
     except Exception as e:
         logger.warning("[TRADE] Tx confirmation check failed: %s", e)
         return "error"
+
+
+def get_token_balance(wallet_address: str, token_mint: str) -> int | None:
+    """Return the wallet's raw token balance across all accounts for a mint."""
+    if not wallet_address or not token_mint:
+        return None
+    try:
+        import rpc_client
+        result = rpc_client.rpc_call(
+            "getTokenAccountsByOwner",
+            [wallet_address, {"mint": token_mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}],
+            preferred_name="Alchemy",
+        )
+        if result is None:
+            return None
+        total = 0
+        for account in result.get("value", []):
+            info = (((account.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+            raw = ((info.get("tokenAmount") or {}).get("amount"))
+            total += int(raw or 0)
+        return total
+    except Exception as e:
+        logger.warning("[TRADE] Token balance lookup failed: %s", e)
+        return None
+
+
+def get_confirmed_token_delta(signature: str, wallet_address: str, token_mint: str) -> int | None:
+    """Read the confirmed transaction and calculate tokens received by a wallet."""
+    try:
+        import rpc_client
+        tx = rpc_client.rpc_call(
+            "getTransaction",
+            [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 0}],
+            preferred_name="Alchemy",
+        )
+        if not tx or not tx.get("meta") or tx["meta"].get("err") is not None:
+            return None
+
+        def owned_amount(entries: list[dict]) -> int:
+            total = 0
+            for item in entries or []:
+                if item.get("owner") == wallet_address and item.get("mint") == token_mint:
+                    total += int(((item.get("uiTokenAmount") or {}).get("amount")) or 0)
+            return total
+
+        meta = tx["meta"]
+        delta = owned_amount(meta.get("postTokenBalances", [])) - owned_amount(meta.get("preTokenBalances", []))
+        return max(0, delta)
+    except Exception as e:
+        logger.warning("[TRADE] Transaction token-delta lookup failed: %s", e)
+        return None

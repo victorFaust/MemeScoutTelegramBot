@@ -82,7 +82,10 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_mc        REAL,
     token_symbol    TEXT,
     wallet_address  TEXT,
-    tx_status       TEXT DEFAULT 'pending'
+    tx_status       TEXT DEFAULT 'pending',
+    onchain_token_amount INTEGER,
+    reconciled_at   REAL,
+    reconciliation_status TEXT DEFAULT 'pending'
 );
 
 CREATE TABLE IF NOT EXISTS watchlist (
@@ -117,6 +120,14 @@ def _connect() -> sqlite3.Connection:
     if "wallet_address" not in position_columns:
         conn.execute("ALTER TABLE positions ADD COLUMN wallet_address TEXT")
         conn.commit()
+    for name, definition in (
+        ("onchain_token_amount", "INTEGER"),
+        ("reconciled_at", "REAL"),
+        ("reconciliation_status", "TEXT DEFAULT 'pending'"),
+    ):
+        if name not in position_columns:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {definition}")
+            conn.commit()
     return conn
 
 
@@ -476,6 +487,21 @@ def get_pending_positions() -> list[dict]:
         conn.close()
 
 
+def get_positions_needing_confirmation() -> list[dict]:
+    """Return submitted buys that still need a terminal on-chain result."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """SELECT * FROM positions
+               WHERE status = 'open' AND tx_status IN ('pending', 'unconfirmed')
+               ORDER BY bought_at ASC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
 def get_position_by_id(position_id: int) -> dict | None:
     """Get a single position by ID."""
     conn = _connect()
@@ -524,6 +550,28 @@ def update_tx_status(position_id: int, status: str) -> None:
             "UPDATE positions SET tx_status = ? WHERE id = ?",
             (status, position_id),
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reconcile_position(position_id: int, onchain_amount: int, status: str,
+                       update_token_amount: bool = False) -> None:
+    """Store an observed wallet balance and optionally correct the position amount."""
+    conn = _connect()
+    try:
+        if update_token_amount:
+            conn.execute(
+                """UPDATE positions SET onchain_token_amount = ?, reconciled_at = ?,
+                   reconciliation_status = ?, token_amount = ? WHERE id = ?""",
+                (onchain_amount, time.time(), status, onchain_amount, position_id),
+            )
+        else:
+            conn.execute(
+                """UPDATE positions SET onchain_token_amount = ?, reconciled_at = ?,
+                   reconciliation_status = ? WHERE id = ?""",
+                (onchain_amount, time.time(), status, position_id),
+            )
         conn.commit()
     finally:
         conn.close()
