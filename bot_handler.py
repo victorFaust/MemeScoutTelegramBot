@@ -93,8 +93,15 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if not query or not query.data:
         return
 
-    await query.answer()
     action = query.data.split(":", 1)[1] if ":" in query.data else query.data
+    if (action in {"sellall", "stop", "autobuy", "autobuy_pools"}
+            or action.startswith("sell_") or action.startswith("set_amount_")):
+        if not _is_authorized(update):
+            logger.warning("[BOT] Unauthorized menu action blocked: %s", action)
+            await query.answer("Not authorized", show_alert=True)
+            return
+
+    await query.answer()
 
     if action == "positions":
         await _show_positions(query)
@@ -133,13 +140,30 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await _show_watchlist(query)
 
 
-async def _show_positions(query) -> None:
+async def _send_positions(target, text: str, reply_markup) -> None:
+    """Render positions to either a callback query or a command message."""
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await target.reply_text(text, reply_markup=reply_markup)
+
+
+def _position_is_sellable(position: dict) -> bool:
+    """Only offer sells when a buy may actually have delivered tokens."""
+    return (
+        position.get("status") == "open"
+        and (position.get("token_amount", 0) or 0) > 0
+        and position.get("tx_status", "confirmed") not in {"pending", "failed", "no_sig"}
+    )
+
+
+async def _show_positions(target) -> None:
     """Show portfolio with live PnL."""
     positions = storage.get_open_positions()
     if not positions:
         recent = storage.get_recent_positions(limit=5)
         if not recent:
-            await query.edit_message_text(
+            await _send_positions(target,
                 "No open positions.\n\nBuy tokens from alerts or use /buy <token> $amount",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("Back", callback_data="menu:back")
@@ -161,7 +185,7 @@ async def _show_positions(query) -> None:
             else:
                 lines.append(f"${sym}: status={status}, buy={spent:.4f} SOL")
 
-        await query.edit_message_text(
+        await _send_positions(target,
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Back", callback_data="menu:back")
@@ -171,12 +195,14 @@ async def _show_positions(query) -> None:
 
     lines = ["PORTFOLIO\n"]
     total_invested = 0.0
+    valued_invested = 0.0
     total_current = 0.0
+    unavailable = 0
     buttons = []
 
     for i, p in enumerate(positions):
         token_addr = p.get("token_address", "?")
-        amount_sol = p.get("buy_amount_sol", 0)
+        amount_sol = p.get("buy_amount_sol", 0) or 0
         pos_id = p.get("id", 0)
         token_amount = p.get("token_amount", 0)
         symbol = p.get("token_symbol") or token_addr[:8]
@@ -190,6 +216,7 @@ async def _show_positions(query) -> None:
             current_val = pnl["current_value_sol"]
             pnl_pct = pnl["pnl_pct"]
             pnl_sol = pnl["pnl_sol"]
+            valued_invested += amount_sol
             total_current += current_val
 
             import dexscreener_client as dex
@@ -220,36 +247,53 @@ async def _show_positions(query) -> None:
                 f"   Price: {_price(entry_price)} -> {_price(current_price)}\n"
                 f"   PnL: {sign}{pnl_pct:.0f}% ({sign}{pnl_sol:.4f} SOL)"
             )
-            buttons.append(InlineKeyboardButton(f"Sell ${symbol}", callback_data=f"menu:sell_{pos_id}"))
         else:
-            lines.append(f"${symbol} | {amount_sol:.4f} SOL | PnL: N/A")
+            unavailable += 1
+            tx_status = p.get("tx_status", "?")
+            lines.append(f"⚪ ${symbol} | {amount_sol:.4f} SOL | PnL: unavailable | tx: {tx_status}")
+
+        if _position_is_sellable(p):
+            buttons.append(InlineKeyboardButton(f"Sell ${symbol}", callback_data=f"menu:sell_{pos_id}"))
 
         lines.append("")
 
-    total_pnl = total_current - total_invested
-    total_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+    total_pnl = total_current - valued_invested
+    total_pct = (total_pnl / valued_invested * 100) if valued_invested > 0 else 0
     sign = "+" if total_pct >= 0 else ""
     lines.append(f"━━━━━━━━━━━━━━━━━━")
     lines.append(f"Invested: {total_invested:.4f} SOL")
-    lines.append(f"Value: {total_current:.4f} SOL")
-    lines.append(f"Total: {sign}{total_pct:.0f}% ({sign}{total_pnl:.4f} SOL)")
+    value_suffix = f" | {unavailable} unavailable" if unavailable else ""
+    lines.append(f"Quoted value: {total_current:.4f} SOL{value_suffix}")
+    if valued_invested > 0:
+        lines.append(f"Quoted PnL: {sign}{total_pct:.0f}% ({sign}{total_pnl:.4f} SOL)")
+    else:
+        lines.append("Quoted PnL: N/A")
 
     # Build button rows (2 per row)
     button_rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
-    button_rows.append([InlineKeyboardButton("Sell All", callback_data="menu:sellall"),
-                        InlineKeyboardButton("Back", callback_data="menu:back")])
+    footer = [InlineKeyboardButton("Back", callback_data="menu:back")]
+    if any(_position_is_sellable(p) for p in positions):
+        footer.insert(0, InlineKeyboardButton("Sell All", callback_data="menu:sellall"))
+    button_rows.append(footer)
 
-    await query.edit_message_text(
+    await _send_positions(target,
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(button_rows)
     )
+
+
+async def _handle_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open the portfolio directly for /positions."""
+    if update.message:
+        await _show_positions(update.message)
 
 
 async def _show_trades(query) -> None:
     """Show Trades screen: pending, open, and recent closed trades (Trojan-style)."""
 
     pending = storage.get_pending_positions()
-    open_pos = storage.get_open_positions()
+    open_pos = [p for p in storage.get_open_positions()
+                if p.get("tx_status") != "pending"]
     closed = storage.get_closed_positions(limit=10)
 
     lines = ["TRADES\n━━━━━━━━━━━━━━━━━━\n"]
@@ -411,7 +455,7 @@ async def _show_trade_detail(query, pos_id: int) -> None:
 
     # Action buttons
     action_buttons = []
-    if status == "open":
+    if _position_is_sellable(pos):
         action_buttons.append(InlineKeyboardButton(f"Sell ${sym}", callback_data=f"menu:sell_{pos_id}"))
     if buy_sig:
         action_buttons.append(InlineKeyboardButton("View Tx", url=f"https://solscan.io/tx/{buy_sig}"))
@@ -559,6 +603,12 @@ async def _sell_position(query, pos_id: int) -> None:
         await query.edit_message_text(f"Position #{pos_id} not found.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu:back")]]))
         return
+    if not _position_is_sellable(pos):
+        await query.edit_message_text(
+            f"Position #{pos_id} is not sellable while transaction status is {pos.get('tx_status', '?')}.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu:positions")]]),
+        )
+        return
 
     symbol = pos.get("token_symbol") or pos["token_address"][:8]
     await query.edit_message_text(f"Selling ${symbol}...")
@@ -586,7 +636,7 @@ async def _sell_position(query, pos_id: int) -> None:
 
 async def _sell_all(query) -> None:
     """Sell all open positions."""
-    positions = storage.get_open_positions()
+    positions = [p for p in storage.get_open_positions() if _position_is_sellable(p)]
     if not positions:
         await query.edit_message_text("No positions to sell.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="menu:back")]]))
@@ -1193,12 +1243,20 @@ async def _handle_sell_command(update: Update, context: ContextTypes.DEFAULT_TYP
     """Handle /sell [id]."""
     if not update.message:
         return
+    if not _is_authorized(update):
+        logger.warning("[BOT] Unauthorized /sell attempt blocked")
+        await update.message.reply_text("Not authorized")
+        return
     args = context.args
-    positions = storage.get_open_positions()
+    positions = [p for p in storage.get_open_positions() if _position_is_sellable(p)]
 
     if not args:
+        await update.message.reply_text("Usage: /sell <id> or /sell all")
+        return
+
+    if args[0].lower() == "all":
         if not positions:
-            await update.message.reply_text("No positions")
+            await update.message.reply_text("No sellable positions")
             return
         await update.message.reply_text(f"Selling {len(positions)} position(s)...")
         for pos in positions:
@@ -1213,7 +1271,7 @@ async def _handle_sell_command(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         pos_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("Usage: /sell <id> or /sell")
+        await update.message.reply_text("Usage: /sell <id> or /sell all")
         return
 
     pos = next((p for p in positions if p["id"] == pos_id), None)
@@ -1427,7 +1485,7 @@ async def start_bot_handler() -> None:
 
     # Register handlers
     app.add_handler(CommandHandler("start", _handle_start))
-    app.add_handler(CommandHandler("positions", lambda u, c: _handle_start(u, c)))
+    app.add_handler(CommandHandler("positions", _handle_positions_command))
     app.add_handler(CommandHandler("status", lambda u, c: _handle_start(u, c)))
     app.add_handler(CommandHandler("trades", _handle_trades_command))
     app.add_handler(CommandHandler("trade", _handle_trade_command))
