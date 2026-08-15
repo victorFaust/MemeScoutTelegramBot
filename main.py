@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import sys
 import time
 from collections import deque
@@ -27,13 +28,43 @@ import telegram_notifier as tg
 import wallet_tracker
 
 
+class _SecretFilter(logging.Filter):
+    """Redact credentials if a dependency includes request URLs in log text."""
+
+    _BOT_TOKEN = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+    _QUERY_SECRET = re.compile(r"(?i)(api-key|token|key)=([^&\s]+)")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        message = self._BOT_TOKEN.sub("bot[REDACTED]", message)
+        message = self._QUERY_SECRET.sub(r"\1=[REDACTED]", message)
+        for secret in (
+            config.TELEGRAM_BOT_TOKEN,
+            config.HELIUS_API_KEY,
+            config.BIRDEYE_API_KEY,
+            config.SOLSCAN_API_KEY,
+            config.QUICKNODE_HTTP_URL,
+            config.SHYFT_HTTP_URL,
+        ):
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+        record.msg = message
+        record.args = ()
+        return True
+
+
 def _setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
+    # python-telegram-bot uses httpx; INFO records contain the bot token in the
+    # request URL and add no operational value.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
+    sh.addFilter(_SecretFilter())
     root.addHandler(sh)
 
     fh = RotatingFileHandler(
@@ -42,6 +73,7 @@ def _setup_logging() -> None:
         backupCount=config.LOG_BACKUP_COUNT,
     )
     fh.setFormatter(fmt)
+    fh.addFilter(_SecretFilter())
     root.addHandler(fh)
 
 
