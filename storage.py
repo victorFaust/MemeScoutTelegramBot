@@ -95,6 +95,29 @@ CREATE TABLE IF NOT EXISTS watchlist (
     price_at_add  REAL,
     mc_at_add     REAL
 );
+
+CREATE TABLE IF NOT EXISTS trade_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id INTEGER,
+    token_address TEXT NOT NULL,
+    token_symbol TEXT,
+    wallet_address TEXT,
+    order_type TEXT NOT NULL,
+    trigger_value REAL NOT NULL,
+    amount_pct REAL,
+    amount_sol REAL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    executed_at REAL,
+    signature TEXT,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trade_orders_active
+ON trade_orders(status, order_type, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_orders_exit_unique
+ON trade_orders(position_id, order_type, trigger_value)
+WHERE position_id IS NOT NULL;
 """
 
 
@@ -619,6 +642,139 @@ def update_position_tokens(position_id: int, new_token_amount: int) -> None:
                 (new_token_amount, position_id),
             )
         conn.commit()
+    finally:
+        conn.close()
+
+
+# -- Persistent trade orders --
+
+def create_trade_order(token_address: str, order_type: str, trigger_value: float,
+                       position_id: int | None = None, token_symbol: str = "",
+                       wallet_address: str = "", amount_pct: float | None = None,
+                       amount_sol: float | None = None) -> int:
+    now = time.time()
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO trade_orders
+               (position_id, token_address, token_symbol, wallet_address, order_type,
+                trigger_value, amount_pct, amount_sol, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (position_id, token_address, token_symbol, wallet_address, order_type,
+             trigger_value, amount_pct, amount_sol, now, now),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def get_active_trade_orders() -> list[dict]:
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM trade_orders WHERE status = 'active' ORDER BY created_at ASC"
+        ).fetchall()]
+    finally:
+        conn.close()
+
+
+def get_trade_orders(limit: int = 50) -> list[dict]:
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM trade_orders ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()]
+    finally:
+        conn.close()
+
+
+def claim_trade_order(order_id: int) -> bool:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE trade_orders SET status = 'executing', updated_at = ? WHERE id = ? AND status = 'active'",
+            (time.time(), order_id),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def complete_trade_order(order_id: int, signature: str) -> None:
+    conn = _connect()
+    try:
+        now = time.time()
+        conn.execute(
+            """UPDATE trade_orders SET status = 'completed', signature = ?, executed_at = ?,
+               updated_at = ?, last_error = NULL WHERE id = ?""",
+            (signature, now, now, order_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def release_trade_order(order_id: int, error: str) -> None:
+    conn = _connect()
+    try:
+        conn.execute(
+            """UPDATE trade_orders SET status = 'active', updated_at = ?, last_error = ?
+               WHERE id = ? AND status = 'executing'""",
+            (time.time(), error[:500], order_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cancel_trade_order(order_id: int) -> bool:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """UPDATE trade_orders SET status = 'cancelled', updated_at = ?
+               WHERE id = ? AND status = 'active'""",
+            (time.time(), order_id),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def cancel_position_orders(position_id: int, exclude_order_id: int | None = None) -> None:
+    conn = _connect()
+    try:
+        if exclude_order_id is None:
+            conn.execute(
+                "UPDATE trade_orders SET status = 'cancelled', updated_at = ? WHERE position_id = ? AND status = 'active'",
+                (time.time(), position_id),
+            )
+        else:
+            conn.execute(
+                """UPDATE trade_orders SET status = 'cancelled', updated_at = ?
+                   WHERE position_id = ? AND id != ? AND status = 'active'""",
+                (time.time(), position_id, exclude_order_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def recover_stale_trade_orders(stale_seconds: int = 300) -> int:
+    conn = _connect()
+    try:
+        now = time.time()
+        cur = conn.execute(
+            """UPDATE trade_orders SET status = 'active', updated_at = ?, last_error = 'recovered after restart'
+               WHERE status = 'executing' AND updated_at < ?""",
+            (now, now - stale_seconds),
+        )
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 

@@ -1013,6 +1013,10 @@ async def _tx_confirmation_loop() -> None:
                     if actual_delta is not None and actual_delta > 0:
                         storage.reconcile_position(pos_id, actual_delta, "confirmed", update_token_amount=True)
                     storage.update_tx_status(pos_id, status)
+                    import order_engine
+                    confirmed_position = storage.get_position_by_id(pos_id)
+                    if confirmed_position:
+                        order_engine.create_default_exit_orders(confirmed_position)
                     symbol = pos.get("token_symbol") or pos.get("token_address", "?")[:8]
                     logger.info("[TX] Position #%d ($%s) confirmed: %s", pos_id, symbol, status)
                     await tg.send_trade_notification(
@@ -1105,6 +1109,39 @@ async def _reconcile_open_positions(force: bool = False) -> None:
             storage.reconcile_position(pos["id"], balance, "matched")
 
 
+async def _order_monitor_loop() -> None:
+    """Evaluate durable trade orders and notify on completed executions."""
+    import order_engine
+
+    recovered = storage.recover_stale_trade_orders(stale_seconds=0)
+    if recovered:
+        logger.warning("[ORDER] Recovered %d interrupted order(s)", recovered)
+    for position in storage.get_open_positions():
+        if position.get("tx_status") in {"confirmed", "finalized"}:
+            order_engine.create_default_exit_orders(position)
+
+    logger.info("[ORDER] Persistent order monitor started (interval=%ds)", config.EXIT_CHECK_INTERVAL)
+    while True:
+        await asyncio.sleep(config.EXIT_CHECK_INTERVAL)
+        if not config.TRADING_ENABLED:
+            continue
+        try:
+            events = await asyncio.to_thread(order_engine.process_orders_once)
+            for event in events:
+                order = event["order"]
+                result = event["result"]
+                symbol = order.get("token_symbol") or order["token_address"][:8]
+                kind = order["order_type"].replace("_", " ").upper()
+                await tg.send_trade_notification(
+                    f"ORDER FILLED #{order['id']}\n"
+                    f"{kind} · ${symbol}\n"
+                    f"Tx: {result.get('signature', '')[:20]}...",
+                    order["token_address"],
+                )
+        except Exception:
+            logger.exception("[ORDER] Monitor cycle failed")
+
+
 # -- Entry point --
 
 async def main() -> None:
@@ -1148,7 +1185,7 @@ async def main() -> None:
     asyncio.create_task(_snapshot_loop())
     asyncio.create_task(_status_log_loop())
     asyncio.create_task(_cleanup_loop())
-    asyncio.create_task(_exit_monitor_loop())
+    asyncio.create_task(_order_monitor_loop())
     asyncio.create_task(_pnl_notification_loop())
     asyncio.create_task(_tx_confirmation_loop())
     asyncio.create_task(_wallet_discovery_loop())
