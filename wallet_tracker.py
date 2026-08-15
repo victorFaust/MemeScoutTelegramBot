@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 # Helius Enhanced Transactions API
 HELIUS_TX_URL = f"https://api.helius.xyz/v0/addresses/{{address}}/transactions?api-key={config.HELIUS_API_KEY}"
 HELIUS_PARSE_URL = f"https://api.helius.xyz/v0/transactions?api-key={config.HELIUS_API_KEY}"
+_fetch_warning_at: dict[str, float] = {}
+_FETCH_WARNING_INTERVAL = 300
 
 # Known DEX program IDs (to identify swaps)
 JUPITER_PROGRAMS = {
@@ -212,12 +214,45 @@ def fetch_recent_swaps(wallet_address: str, limit: int = 10) -> list[dict]:
         return []
 
     url = HELIUS_TX_URL.format(address=wallet_address)
-    try:
-        resp = requests.get(url, params={"limit": limit, "type": "SWAP"}, timeout=15)
-        resp.raise_for_status()
-        txs = resp.json()
-    except Exception as e:
-        logger.warning("[WALLET] Failed to fetch txs for %s: %s", wallet_address[:12], e)
+    last_error = "unknown error"
+    txs = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params={"limit": limit, "type": "SWAP"}, timeout=15)
+            if resp.status_code == 429:
+                last_error = "Helius rate limit (429)"
+                retry_after = resp.headers.get("Retry-After", "")
+                try:
+                    delay = min(10.0, max(1.0, float(retry_after)))
+                except (TypeError, ValueError):
+                    delay = float(2 ** attempt)
+                time.sleep(delay)
+                continue
+            if 500 <= resp.status_code < 600:
+                last_error = f"Helius server error ({resp.status_code})"
+                time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            txs = resp.json()
+            break
+        except requests.RequestException as exc:
+            # Exception strings can contain credential-bearing URLs. Log only
+            # the exception type and retry with bounded backoff.
+            last_error = type(exc).__name__
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+        except ValueError:
+            last_error = "invalid JSON response"
+            break
+    else:
+        txs = None
+
+    if txs is None:
+        now = time.time()
+        if now - _fetch_warning_at.get(wallet_address, 0) >= _FETCH_WARNING_INTERVAL:
+            logger.warning("[WALLET] Failed to fetch txs for %s after retries: %s",
+                           wallet_address[:12], last_error)
+            _fetch_warning_at[wallet_address] = now
         return []
 
     swaps = []
