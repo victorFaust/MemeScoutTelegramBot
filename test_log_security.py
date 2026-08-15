@@ -94,6 +94,26 @@ class AlchemyProviderTests(unittest.TestCase):
             "https://solana-mainnet.g.alchemy.com/v2/test",
         )
 
+    @patch("wallet_tracker.rpc_client.rpc_call")
+    @patch("wallet_tracker.config.ALCHEMY_RPC_URL", "https://alchemy.test")
+    def test_alchemy_extracts_early_token_recipient(self, rpc_call):
+        def balance(owner, amount):
+            return {"owner": owner, "mint": "TOKEN",
+                    "uiTokenAmount": {"uiAmount": amount}}
+        rpc_call.return_value = {"transactions": [{"meta": {
+            "preTokenBalances": [balance("buyer", 0)],
+            "postTokenBalances": [balance("buyer", 25)],
+        }}]}
+        buyers = wallet_tracker._fetch_early_buyers_alchemy("TOKEN", 10)
+        self.assertEqual(buyers, ["buyer"])
+
+    @patch("wallet_tracker._get_from_url")
+    def test_empty_birdeye_result_is_not_a_provider_failure(self, get_url):
+        response = Mock()
+        response.json.return_value = {"data": {"items": []}}
+        get_url.return_value = response
+        self.assertEqual(wallet_tracker._fetch_early_buyers_birdeye("TOKEN", 10), [])
+
 
 if __name__ == "__main__":
     unittest.main()
