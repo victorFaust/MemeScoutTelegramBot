@@ -47,6 +47,8 @@ The `/start` dashboard provides market buy/sell, reconciled positions, persisten
 
 Confirmed buys automatically receive durable stop-loss and staged take-profit orders. Transaction confirmation and wallet token balances are reconciled in the background; mismatches are surfaced without silently rewriting trade history.
 
+Tracked wallets use Alchemy WebSocket log subscriptions for low-latency detection. The tracker reconnects automatically, refreshes subscriptions when the wallet list changes, and runs an RPC polling pass during every stream outage. Stream mode, subscription count, and recent processing latency appear on the Wallets screen.
+
 ### 3. Per-Chain Configuration
 
 All filter thresholds, scoring weights, and safety check tolerances are in `chain_config.yaml`. Edit this file to tune per chain -- no Python changes needed.

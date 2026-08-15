@@ -575,6 +575,8 @@ async def _show_wallet(query) -> None:
     all_wallets = executor.get_all_wallet_addresses()
     balance = executor.get_wallet_balance()
     sol_price = executor.get_sol_price()
+    import wallet_tracker
+    tracker = wallet_tracker.get_tracker_health()
 
     bal_str = f"{balance['sol']:.4f} SOL (${balance['usd']:.2f})" if balance else "N/A"
 
@@ -582,6 +584,9 @@ async def _show_wallet(query) -> None:
         "WALLET\n━━━━━━━━━━━━━━━━━━",
         f"Balance: {bal_str}",
         f"SOL Price: ${sol_price:.2f}",
+        f"Tracker: {tracker['mode']} · {tracker['subscriptions']} subscriptions",
+        (f"Last event processing: {tracker['last_latency_ms']}ms"
+         if tracker.get("last_latency_ms") is not None else "Last event processing: waiting"),
         "",
     ]
     if len(all_wallets) > 1:
