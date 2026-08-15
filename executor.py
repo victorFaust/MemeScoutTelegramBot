@@ -7,6 +7,7 @@ Supports Jito bundles for MEV protection and dynamic slippage.
 
 import base64
 import logging
+import threading
 import time
 from typing import Any
 
@@ -16,6 +17,20 @@ import config
 import storage
 
 logger = logging.getLogger(__name__)
+_buy_lock = threading.Lock()
+
+
+def _single_buy_at_a_time(func):
+    """Prevent concurrent callbacks from bypassing position/daily limits."""
+    def wrapped(*args, **kwargs):
+        if not _buy_lock.acquire(blocking=False):
+            logger.warning("[TRADE] Buy blocked: another buy is already in progress")
+            return None
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _buy_lock.release()
+    return wrapped
 
 JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
@@ -91,10 +106,10 @@ def get_sol_price() -> float:
         if price > 0:
             _sol_price_usd = price
             _sol_price_updated = time.time()
-        return _sol_price_usd or 170.0
+        return _sol_price_usd
     except Exception as e:
         logger.warning("[TRADE] Failed to fetch SOL price: %s", e)
-        return _sol_price_usd or 170.0  # fallback
+        return _sol_price_usd
 
 
 def usd_to_sol(usd_amount: float) -> float:
@@ -337,7 +352,7 @@ def get_sell_quote(token_mint: str, token_amount: int) -> dict | None:
         return None
 
 
-def execute_swap(quote: dict) -> dict | None:
+def execute_swap(quote: dict, wallet_address: str | None = None) -> dict | None:
     """Execute a swap via Jito bundle (MEV-protected), falling back to regular RPC.
 
     Uses round-robin across the wallet pool to reduce on-chain fingerprinting.
@@ -346,15 +361,23 @@ def execute_swap(quote: dict) -> dict | None:
     from solders.keypair import Keypair  # type: ignore
     from solders.transaction import VersionedTransaction  # type: ignore
 
-    # Round-robin wallet selection
+    # Buys use round-robin selection. Sells provide the wallet that owns the
+    # position so tokens are never signed from a different configured wallet.
     pool = _get_all_keypairs()
     if not pool:
         logger.error("[TRADE] No trading wallet configured")
         return None
-    kp = pool[_wallet_index % len(pool)]
-    _wallet_index += 1
-    if len(pool) > 1:
-        logger.debug("[TRADE] Using wallet %d/%d for this swap", (_wallet_index - 1) % len(pool) + 1, len(pool))
+    if wallet_address:
+        kp = next((candidate for candidate in pool
+                   if str(candidate.pubkey()) == wallet_address), None)
+        if kp is None:
+            logger.error("[TRADE] Position wallet is not configured: %s", wallet_address[:12])
+            return None
+    else:
+        kp = pool[_wallet_index % len(pool)]
+        _wallet_index += 1
+        if len(pool) > 1:
+            logger.debug("[TRADE] Using wallet %d/%d for this swap", (_wallet_index - 1) % len(pool) + 1, len(pool))
 
     wallet_address = str(kp.pubkey())
 
@@ -397,11 +420,15 @@ def execute_swap(quote: dict) -> dict | None:
     # Try Jito bundle first (MEV-protected)
     result = _submit_jito_bundle(signed_b64)
     if result:
+        result["wallet_address"] = wallet_address
         return result
 
     # Fallback to regular RPC
     logger.info("[TRADE] Jito bundle failed, falling back to regular RPC")
-    return _submit_rpc(signed_b64)
+    result = _submit_rpc(signed_b64)
+    if result:
+        result["wallet_address"] = wallet_address
+    return result
 
 
 def can_trade() -> tuple[bool, str]:
@@ -429,6 +456,7 @@ def can_trade() -> tuple[bool, str]:
     return True, "OK"
 
 
+@_single_buy_at_a_time
 def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
     """Execute a buy (SOL -> token) with all safety checks.
     
@@ -439,12 +467,26 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
     if amount_sol is None:
         amount_sol = config.TRADE_AMOUNT_SOL
 
+    if amount_sol <= 0:
+        logger.warning("[TRADE] Buy blocked: invalid SOL amount")
+        return None
+    try:
+        from solders.pubkey import Pubkey  # type: ignore
+        Pubkey.from_string(token_mint)
+    except Exception:
+        logger.warning("[TRADE] Buy blocked: invalid token mint")
+        return None
+
     logger.info("[TRADE] Buy requested: token=%s amount_sol=%.6f", token_mint[:16], amount_sol)
 
     # Safety checks
     allowed, reason = can_trade()
     if not allowed:
         logger.warning("[TRADE] Buy blocked: %s", reason)
+        return None
+    _reset_daily_if_needed()
+    if _daily_spent_sol + amount_sol > config.DAILY_LOSS_LIMIT_SOL:
+        logger.warning("[TRADE] Buy blocked: amount would exceed daily limit")
         return None
 
     # Get quote
@@ -494,6 +536,7 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
             entry_price_usd=entry_price_usd,
             entry_mc=entry_mc,
             token_symbol=token_symbol,
+            wallet_address=result.get("wallet_address", ""),
         )
     except Exception:
         position_recorded = False
@@ -541,7 +584,9 @@ def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | N
                     continue
                 return None
 
-            result = execute_swap(quote)
+            position = storage.get_position_by_id(position_id) or {}
+            owner_wallet = position.get("wallet_address") or get_wallet_address()
+            result = execute_swap(quote, wallet_address=owner_wallet)
             if result is not None:
                 if attempt > 1:
                     logger.info("[TRADE] Sell succeeded on attempt %d with %d bps slippage", attempt, extra_bps)
@@ -588,7 +633,9 @@ def sell_partial(position_id: int, token_mint: str, token_amount: int, sell_pct:
         quote = get_sell_quote(token_mint, sell_amount)
         if quote is None:
             return None
-        result = execute_swap(quote)
+        position = storage.get_position_by_id(position_id) or {}
+        owner_wallet = position.get("wallet_address") or get_wallet_address()
+        result = execute_swap(quote, wallet_address=owner_wallet)
         if result is None:
             return None
         sol_received = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL

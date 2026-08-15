@@ -53,6 +53,11 @@ class PositionClaimTests(unittest.TestCase):
         storage.release_position_sell(self.position_id)
         self.assertTrue(storage.claim_position_for_sell(self.position_id))
 
+    def test_position_keeps_owning_wallet(self):
+        storage.record_position("token-2", "solana", 0.5, 50, "sig-2", wallet_address="wallet-2")
+        position = next(p for p in storage.get_open_positions() if p["token_address"] == "token-2")
+        self.assertEqual(position["wallet_address"], "wallet-2")
+
 
 class PositionRenderingTests(unittest.IsolatedAsyncioTestCase):
     @patch("dexscreener_client.fetch_pair_details", return_value=[])

@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_price_usd REAL,
     entry_mc        REAL,
     token_symbol    TEXT,
+    wallet_address  TEXT,
     tx_status       TEXT DEFAULT 'pending'
 );
 
@@ -111,6 +112,10 @@ def _connect() -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE alert_outcomes ADD COLUMN alert_source TEXT NOT NULL DEFAULT 'legacy'"
         )
+        conn.commit()
+    position_columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+    if "wallet_address" not in position_columns:
+        conn.execute("ALTER TABLE positions ADD COLUMN wallet_address TEXT")
         conn.commit()
     return conn
 
@@ -359,6 +364,7 @@ def record_position(
     token_amount: int, buy_signature: str,
     entry_price_usd: float | None = None, entry_mc: float | None = None,
     token_symbol: str = "",
+    wallet_address: str = "",
 ) -> None:
     """Record a new open position with entry price and MC."""
     last_error: Exception | None = None
@@ -367,10 +373,11 @@ def record_position(
         try:
             conn.execute(
                 """INSERT INTO positions (token_address, chain_id, buy_amount_sol, token_amount,
-                   buy_signature, bought_at, status, entry_price_usd, entry_mc, token_symbol)
-                   VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
+                   buy_signature, bought_at, status, entry_price_usd, entry_mc, token_symbol,
+                   wallet_address)
+                   VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
                 (token_address, chain_id, buy_amount_sol, token_amount, buy_signature,
-                 time.time(), entry_price_usd, entry_mc, token_symbol),
+                 time.time(), entry_price_usd, entry_mc, token_symbol, wallet_address),
             )
             conn.commit()
             logger.info("[DB] Position recorded: %s sig=%s", token_address[:16], buy_signature[:16])
