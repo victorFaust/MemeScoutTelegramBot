@@ -225,6 +225,7 @@ async def _run_chain_cycle(chain_id: str) -> None:
                 price=_safe_float(pair.get("priceUsd")),
                 liquidity=(pair.get("liquidity") or {}).get("usd"),
                 market_cap=pair.get("marketCap") or pair.get("fdv"),
+                alert_source="scan",
             )
             # Log ML features for learning system
             feature_logger.log_features(
@@ -234,6 +235,7 @@ async def _run_chain_cycle(chain_id: str) -> None:
                 score_result=result,
                 pair=pair,
                 safety_data=safety_data,
+                alert_source="scan",
             )
             sent += 1
 
@@ -328,6 +330,17 @@ async def _handle_new_pool(token_info: dict) -> None:
     if ok:
         _pool_alert_times.append(time.time())
         storage.record_alert(chain_id, token_address, 0)
+        storage.record_outcome(
+            token_address=token_address,
+            chain_id=chain_id,
+            pair_address=pair.get("pairAddress", ""),
+            token_symbol=token_info.get("symbol", "?"),
+            score=0,
+            price=_safe_float(pair.get("priceUsd")),
+            liquidity=(pair.get("liquidity") or {}).get("usd"),
+            market_cap=pair.get("marketCap") or pair.get("fdv"),
+            alert_source="pool",
+        )
         logger.info("[POOL] Alert sent: $%s (%s) | %d txns",
                     token_info["symbol"], token_address[:16], total_txns)
 
@@ -340,6 +353,7 @@ async def _handle_new_pool(token_info: dict) -> None:
             score_result=pool_score_result,
             pair=pair,
             safety_data=rc_data,
+            alert_source="pool",
         )
 
 
@@ -470,6 +484,7 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
             price=price,
             liquidity=liq,
             market_cap=mc,
+            alert_source="wallet",
         )
 
     # Rate limits: prevent spam buys

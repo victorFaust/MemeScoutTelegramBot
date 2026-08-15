@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS alert_outcomes (
     checked_1h          INTEGER DEFAULT 0,
     checked_6h          INTEGER DEFAULT 0,
     checked_24h         INTEGER DEFAULT 0,
-    rugged              INTEGER DEFAULT 0
+    rugged              INTEGER DEFAULT 0,
+    alert_source        TEXT NOT NULL DEFAULT 'legacy'
 );
 
 CREATE TABLE IF NOT EXISTS token_metrics (
@@ -102,6 +103,14 @@ def _connect() -> sqlite3.Connection:
         conn.execute("SELECT tx_status FROM positions LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE positions ADD COLUMN tx_status TEXT DEFAULT 'confirmed'")
+        conn.commit()
+    # Migrate outcome provenance for existing production databases. Historical
+    # rows remain explicitly "legacy" rather than being guessed from score.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(alert_outcomes)")}
+    if "alert_source" not in columns:
+        conn.execute(
+            "ALTER TABLE alert_outcomes ADD COLUMN alert_source TEXT NOT NULL DEFAULT 'legacy'"
+        )
         conn.commit()
     return conn
 
@@ -199,6 +208,7 @@ def record_outcome(
     price: float | None,
     liquidity: float | None,
     market_cap: float | None,
+    alert_source: str = "unknown",
 ) -> None:
     """Record an alert outcome row when an alert is sent."""
     conn = _connect()
@@ -206,10 +216,11 @@ def record_outcome(
         conn.execute(
             """INSERT INTO alert_outcomes
                (token_address, chain_id, pair_address, token_symbol, alerted_at,
-                score_at_alert, price_at_alert, liquidity_at_alert, market_cap_at_alert)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                score_at_alert, price_at_alert, liquidity_at_alert, market_cap_at_alert,
+                alert_source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (token_address, chain_id, pair_address, token_symbol, time.time(),
-             score, price, liquidity, market_cap),
+             score, price, liquidity, market_cap, alert_source),
         )
         conn.commit()
     finally:

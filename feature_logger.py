@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS ml_features (
     token_address       TEXT NOT NULL,
     chain_id            TEXT NOT NULL,
     token_symbol        TEXT,
+    alert_source        TEXT NOT NULL DEFAULT 'legacy',
     alerted_at          REAL NOT NULL,
 
     -- Scoring breakdown (0-1 each)
@@ -93,6 +94,12 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(storage.DB_PATH))
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.executescript(_FEATURES_TABLE)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(ml_features)")}
+    if "alert_source" not in columns:
+        conn.execute(
+            "ALTER TABLE ml_features ADD COLUMN alert_source TEXT NOT NULL DEFAULT 'legacy'"
+        )
+        conn.commit()
     return conn
 
 
@@ -103,6 +110,7 @@ def log_features(
     score_result: dict,
     pair: dict,
     safety_data: dict | None = None,
+    alert_source: str = "unknown",
 ) -> None:
     """Capture all features for a token at alert time.
 
@@ -151,7 +159,7 @@ def log_features(
     try:
         conn.execute(
             """INSERT OR REPLACE INTO ml_features (
-                token_address, chain_id, token_symbol, alerted_at,
+                token_address, chain_id, token_symbol, alert_source, alerted_at,
                 score_total, score_liquidity, score_market_cap, score_pair_age,
                 score_vol_liq, score_price_change, score_buy_sell, score_velocity,
                 liquidity_usd, market_cap, volume_24h, volume_6h, volume_1h,
@@ -160,9 +168,9 @@ def log_features(
                 pair_age_hours, vol_liq_ratio, buy_sell_ratio_1h,
                 rugcheck_score, lp_locked_pct, top_holder_pct, unique_buyers, risk_count, is_mint_authority,
                 hour_utc, day_of_week, is_us_hours
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                token_address, chain_id, token_symbol, now,
+                token_address, chain_id, token_symbol, alert_source, now,
                 score_result.get("score", 0),
                 breakdown.get("liquidity", 0),
                 breakdown.get("market_cap", 0),
