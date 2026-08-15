@@ -211,7 +211,9 @@ def fetch_recent_swaps(wallet_address: str, limit: int = 10) -> list[dict]:
     if previous:
         options["until"] = previous
 
-    signatures = rpc_client.rpc_call("getSignaturesForAddress", [wallet_address, options])
+    signatures = rpc_client.rpc_call(
+        "getSignaturesForAddress", [wallet_address, options], preferred_name="Alchemy"
+    )
     if signatures is None:
         now = time.time()
         if now - _fetch_warning_at.get(wallet_address, 0) >= _FETCH_WARNING_INTERVAL:
@@ -229,7 +231,7 @@ def fetch_recent_swaps(wallet_address: str, limit: int = 10) -> list[dict]:
             signature,
             {"encoding": "jsonParsed", "commitment": "confirmed",
              "maxSupportedTransactionVersion": 0},
-        ])
+        ], preferred_name="Alchemy")
         if tx is None:
             all_fetched = False
             continue

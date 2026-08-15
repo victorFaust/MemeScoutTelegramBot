@@ -1,6 +1,6 @@
 """Shared Solana RPC client with multi-provider load balancing.
 
-Distributes calls across QuickNode, Shyft, and public RPCs.
+Distributes calls across Alchemy, QuickNode, Shyft, and public RPCs.
 Auto-rotates on rate limit (429) errors.
 """
 
@@ -28,6 +28,13 @@ def _init_providers() -> None:
     """Initialize the provider list from config."""
     global _providers, _initialized
     _providers = []
+
+    if config.ALCHEMY_RPC_URL:
+        _providers.append({
+            "name": "Alchemy",
+            "url": config.ALCHEMY_RPC_URL,
+            "tier": "premium",
+        })
 
     # Premium providers (QuickNode, Shyft) — used for heavy calls
     if config.QUICKNODE_HTTP_URL:
@@ -96,13 +103,15 @@ def _mark_rate_limited(provider_name: str) -> None:
     logger.warning("[RPC] %s rate-limited — cooldown %ds", provider_name, _COOLDOWN_SECONDS)
 
 
-def rpc_call(method: str, params: list, tier: str | None = None) -> Any:
+def rpc_call(method: str, params: list, tier: str | None = None,
+             preferred_name: str | None = None) -> Any:
     """Make a Solana RPC call with automatic provider rotation.
     
     Args:
         method: RPC method name
         params: RPC params list
-        tier: "premium" for QuickNode/Shyft, "public" for free RPCs, None for any
+        tier: "premium" for paid providers, "public" for free RPCs, None for any
+        preferred_name: provider to try first before rotating through fallbacks
     
     Returns: RPC result or None on failure
     """
@@ -114,12 +123,28 @@ def rpc_call(method: str, params: list, tier: str | None = None) -> Any:
                       "getTokenAccountBalance", "getProgramAccounts"}
     skip_shyft = method in _INDEX_METHODS
 
-    # Try up to 3 providers
-    for attempt in range(min(3, len(_providers))):
-        provider = _get_provider(tier)
+    # Try the preferred provider first, then rotate through fallbacks.
+    tried_names: set[str] = set()
+    for attempt in range(min(4, len(_providers))):
+        provider = None
+        if attempt == 0 and preferred_name:
+            now = time.time()
+            provider = next((p for p in _providers
+                             if p["name"] == preferred_name
+                             and (tier is None or p["tier"] == tier)
+                             and now >= _provider_cooldowns.get(p["name"], 0)), None)
+        attempts_to_select = 0
+        while provider is None or provider["name"] in tried_names:
+            provider = _get_provider(tier)
+            attempts_to_select += 1
+            if provider is None or attempts_to_select > len(_providers):
+                break
         if provider is None:
             logger.error("[RPC] No available providers")
             return None
+        if provider["name"] in tried_names:
+            break
+        tried_names.add(provider["name"])
 
         # Skip Shyft for index methods
         if skip_shyft and provider["name"] == "Shyft":
