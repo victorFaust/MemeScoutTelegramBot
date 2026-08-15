@@ -1,6 +1,8 @@
 # DexScreener Memecoin Alert Bot
 
-Monitors DexScreener for ultra-low-cap memecoins with breakout potential and sends alerts to Telegram. **Read-only / alert-only** -- no trading or wallet functionality.
+Monitors low-cap tokens, scores and safety-checks candidates, tracks smart wallets, and provides a private Telegram trading dashboard for Solana execution through Jupiter and Jito.
+
+> Trading uses a hot wallet. Keep only trading funds in it, restrict `TELEGRAM_CHAT_ID`, and never commit private keys.
 
 ## Quick Start
 
@@ -28,6 +30,22 @@ Global settings (in `.env`):
 - `DEDUP_COOLDOWN_HOURS` -- dedup window (default: `6`)
 - `SAFETY_CHECK_CACHE_HOURS` -- cache GoPlus results (default: `1`)
 - `SKIP_ON_SAFETY_CHECK_FAILURE` -- `true` = skip alert if safety API fails (default: `true`)
+
+Trading requires `TRADING_ENABLED=true` and `TRADING_WALLET_PRIVATE_KEY`. Optional additional wallets are configured with `TRADING_WALLET_KEYS`. RPC provider secrets, including `ALCHEMY_RPC_URL`, should be configured in Render rather than committed.
+
+## Telegram Trading
+
+The `/start` dashboard provides market buy/sell, reconciled positions, persistent orders, wallets, execution profiles, watchlist, history, auto-buy controls, and an emergency stop.
+
+- `/buy <token_address> $5` — submit a market buy
+- `/limitbuy <token_address> <price_usd> $5` — create a restart-safe limit buy
+- `/positions` and `/sell <id>` — inspect or close positions
+- `/orders` and `/cancelorder <id>` — manage persistent limit/stop-loss/take-profit orders
+- `/profile <wallet#> <slippage%> <priority_lamports> <jito_tip> <on|off> [presets]` — configure execution per wallet
+- `/trades`, `/trade <id>`, and `/pnl` — review lifecycle and performance
+- `/stop` — disable trading and auto-buy immediately
+
+Confirmed buys automatically receive durable stop-loss and staged take-profit orders. Transaction confirmation and wallet token balances are reconciled in the background; mismatches are surfaced without silently rewriting trade history.
 
 ### 3. Per-Chain Configuration
 
@@ -123,5 +141,8 @@ filters.py              Per-chain scoring and filtering
 safety_check.py         GoPlus honeypot/contract safety checks
 telegram_notifier.py    Telegram message formatting + sending
 storage.py              SQLite dedup + safety cache
+executor.py             Jupiter quotes, signing, Jito/RPC submission, reconciliation
+order_engine.py         Persistent limit and exit order evaluation
+bot_handler.py          Private Telegram trading dashboard and commands
 test_safety.py          Test script for safety_check module
 ```
