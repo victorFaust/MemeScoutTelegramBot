@@ -1,8 +1,8 @@
-"""Regression tests for credential masking and wallet API retries."""
+"""Regression tests for credential masking and RPC wallet tracking."""
 
 import logging
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import main
 import wallet_tracker
@@ -22,32 +22,50 @@ class SecretFilterTests(unittest.TestCase):
         self.assertIn("[REDACTED]", message)
 
 
-class WalletRetryTests(unittest.TestCase):
+class WalletRpcTests(unittest.TestCase):
     def setUp(self):
         wallet_tracker._fetch_warning_at.clear()
+        wallet_tracker._last_wallet_signature.clear()
 
-    @patch("wallet_tracker.time.sleep")
-    @patch("wallet_tracker.requests.get")
-    def test_rate_limit_retries_then_succeeds(self, request_get, _sleep):
-        limited = Mock(status_code=429, headers={"Retry-After": "1"})
-        success = Mock(status_code=200, headers={})
-        success.raise_for_status.return_value = None
-        success.json.return_value = []
-        request_get.side_effect = [limited, success]
-        self.assertEqual(wallet_tracker.fetch_recent_swaps("wallet"), [])
-        self.assertEqual(request_get.call_count, 2)
+    def _transaction(self, sol_before=2_000_000_000, sol_after=1_000_000_000,
+                     token_before=0, token_after=100):
+        def bal(amount):
+            return {"owner": "wallet", "mint": "TOKEN",
+                    "uiTokenAmount": {"uiAmount": amount}}
+        return {
+            "blockTime": 123,
+            "transaction": {"message": {"accountKeys": [{"pubkey": "wallet"}]}},
+            "meta": {
+                "preBalances": [sol_before], "postBalances": [sol_after],
+                "preTokenBalances": [bal(token_before)],
+                "postTokenBalances": [bal(token_after)],
+            },
+        }
 
-    @patch("wallet_tracker.time.sleep")
-    @patch("wallet_tracker.requests.get")
-    def test_failure_warning_does_not_include_url(self, request_get, _sleep):
-        request_get.side_effect = wallet_tracker.requests.ConnectionError(
-            "https://api.helius.xyz/?api-key=secret"
-        )
+    def test_parses_native_sol_buy(self):
+        swap = wallet_tracker._parse_rpc_swap(self._transaction(), "wallet", "sig")
+        self.assertEqual(swap["token_bought"], "TOKEN")
+        self.assertEqual(swap["token_sold"], wallet_tracker.SOL_MINT)
+        self.assertEqual(swap["amount_sol"], 1.0)
+
+    @patch("wallet_tracker.rpc_client.rpc_call")
+    def test_fetch_uses_cursor_on_next_poll(self, rpc_call):
+        rpc_call.side_effect = [
+            [{"signature": "sig1", "err": None}], self._transaction(), []
+        ]
+        swaps = wallet_tracker.fetch_recent_swaps("wallet", 5)
+        self.assertEqual(len(swaps), 1)
+        wallet_tracker.fetch_recent_swaps("wallet", 5)
+        second_options = rpc_call.call_args_list[2].args[1][1]
+        self.assertEqual(second_options["until"], "sig1")
+
+    @patch("wallet_tracker.rpc_client.rpc_call", return_value=None)
+    def test_provider_failure_warning_is_throttled(self, _rpc_call):
         with self.assertLogs("wallet_tracker", level="WARNING") as logs:
             wallet_tracker.fetch_recent_swaps("wallet-address")
+            wallet_tracker.fetch_recent_swaps("wallet-address")
         text = " ".join(logs.output)
-        self.assertNotIn("secret", text)
-        self.assertIn("ConnectionError", text)
+        self.assertEqual(text.count("All RPC providers failed"), 1)
 
 
 if __name__ == "__main__":

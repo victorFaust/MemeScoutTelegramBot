@@ -46,10 +46,6 @@ QUICKNODE_HTTP_URL: str = os.getenv("QUICKNODE_HTTP_URL", "")
 # Shyft Solana
 SHYFT_HTTP_URL: str = os.getenv("SHYFT_HTTP_URL", "")
 
-# Helius API
-HELIUS_API_KEY: str = os.getenv("HELIUS_API_KEY", "")
-HELIUS_RPC_URL: str = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
-
 # Birdeye API (optional — free public tier works without a key)
 BIRDEYE_API_KEY: str = os.getenv("BIRDEYE_API_KEY", "")
 

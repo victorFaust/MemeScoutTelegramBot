@@ -1,6 +1,6 @@
 ﻿"""Smart Money Wallet Tracker -- copy-trade proven winners.
 
-Monitors a curated list of high-win-rate wallets via Helius API.
+Monitors curated Solana wallets through the shared multi-provider RPC client.
 When a tracked wallet buys a new token:
   1. Checks if it passes safety filters
   2. Calculates confidence (how many tracked wallets are in)
@@ -18,15 +18,14 @@ from typing import Any
 import requests
 
 import config
+import rpc_client
 import storage
 
 logger = logging.getLogger(__name__)
 
-# Helius Enhanced Transactions API
-HELIUS_TX_URL = f"https://api.helius.xyz/v0/addresses/{{address}}/transactions?api-key={config.HELIUS_API_KEY}"
-HELIUS_PARSE_URL = f"https://api.helius.xyz/v0/transactions?api-key={config.HELIUS_API_KEY}"
 _fetch_warning_at: dict[str, float] = {}
 _FETCH_WARNING_INTERVAL = 300
+_last_wallet_signature: dict[str, str] = {}
 
 # Known DEX program IDs (to identify swaps)
 JUPITER_PROGRAMS = {
@@ -203,134 +202,98 @@ def get_confidence_for_token(token: str) -> int:
         conn.close()
 
 
-# -- Helius Transaction Fetching --
+# -- Multi-provider RPC transaction fetching --
 
 def fetch_recent_swaps(wallet_address: str, limit: int = 10) -> list[dict]:
-    """Fetch recent swap transactions for a wallet using Helius parsed transactions API.
+    """Fetch new wallet swaps through standard Solana JSON-RPC."""
+    options: dict[str, Any] = {"limit": limit, "commitment": "confirmed"}
+    previous = _last_wallet_signature.get(wallet_address)
+    if previous:
+        options["until"] = previous
 
-    Returns list of {token_bought, token_sold, signature, timestamp} dicts.
-    """
-    if not config.HELIUS_API_KEY:
-        return []
-
-    url = HELIUS_TX_URL.format(address=wallet_address)
-    last_error = "unknown error"
-    txs = None
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, params={"limit": limit, "type": "SWAP"}, timeout=15)
-            if resp.status_code == 429:
-                last_error = "Helius rate limit (429)"
-                retry_after = resp.headers.get("Retry-After", "")
-                try:
-                    delay = min(10.0, max(1.0, float(retry_after)))
-                except (TypeError, ValueError):
-                    delay = float(2 ** attempt)
-                time.sleep(delay)
-                continue
-            if 500 <= resp.status_code < 600:
-                last_error = f"Helius server error ({resp.status_code})"
-                time.sleep(2 ** attempt)
-                continue
-            resp.raise_for_status()
-            txs = resp.json()
-            break
-        except requests.RequestException as exc:
-            # Exception strings can contain credential-bearing URLs. Log only
-            # the exception type and retry with bounded backoff.
-            last_error = type(exc).__name__
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-        except ValueError:
-            last_error = "invalid JSON response"
-            break
-    else:
-        txs = None
-
-    if txs is None:
+    signatures = rpc_client.rpc_call("getSignaturesForAddress", [wallet_address, options])
+    if signatures is None:
         now = time.time()
         if now - _fetch_warning_at.get(wallet_address, 0) >= _FETCH_WARNING_INTERVAL:
-            logger.warning("[WALLET] Failed to fetch txs for %s after retries: %s",
-                           wallet_address[:12], last_error)
+            logger.warning("[WALLET] All RPC providers failed for wallet %s", wallet_address[:12])
             _fetch_warning_at[wallet_address] = now
         return []
 
     swaps = []
-    for tx in txs:
+    all_fetched = True
+    for sig_info in reversed(signatures):
+        signature = sig_info.get("signature", "")
+        if not signature or sig_info.get("err"):
+            continue
+        tx = rpc_client.rpc_call("getTransaction", [
+            signature,
+            {"encoding": "jsonParsed", "commitment": "confirmed",
+             "maxSupportedTransactionVersion": 0},
+        ])
+        if tx is None:
+            all_fetched = False
+            continue
         try:
-            swap = _parse_helius_swap(tx, wallet_address)
+            swap = _parse_rpc_swap(tx, wallet_address, signature)
             if swap:
                 swaps.append(swap)
-        except Exception:
-            continue
-
+        except (KeyError, TypeError, ValueError):
+            logger.debug("[WALLET] Could not parse transaction %s", signature[:16])
+    if signatures and all_fetched:
+        _last_wallet_signature[wallet_address] = signatures[0].get("signature", previous or "")
     return swaps
 
 
-def _parse_helius_swap(tx: dict, wallet_address: str) -> dict | None:
-    """Parse a Helius enhanced transaction into a simple swap record.
+def _token_amount(balance: dict) -> float:
+    amount = balance.get("uiTokenAmount") or {}
+    if amount.get("uiAmount") is not None:
+        return float(amount["uiAmount"] or 0)
+    raw = float(amount.get("amount", 0) or 0)
+    return raw / (10 ** int(amount.get("decimals", 0) or 0))
 
-    Returns {token_bought, token_sold, amount_sol, signature, timestamp} or None.
-    """
-    sig = tx.get("signature", "")
-    timestamp = tx.get("timestamp", 0)
-    tx_type = tx.get("type", "")
 
-    if tx_type != "SWAP":
+def _parse_rpc_swap(tx: dict, wallet_address: str, signature: str = "") -> dict | None:
+    """Infer a swap from parsed token and SOL balance changes."""
+    meta = tx.get("meta") or {}
+    if meta.get("err"):
+        return None
+    message = ((tx.get("transaction") or {}).get("message") or {})
+    account_keys = message.get("accountKeys") or []
+    keys = [k.get("pubkey", "") if isinstance(k, dict) else str(k) for k in account_keys]
+    try:
+        wallet_index = keys.index(wallet_address)
+    except ValueError:
         return None
 
-    # Look at token transfers to determine what was bought/sold
-    token_transfers = tx.get("tokenTransfers") or []
-    native_transfers = tx.get("nativeTransfers") or []
+    pre_sol = meta.get("preBalances") or []
+    post_sol = meta.get("postBalances") or []
+    sol_delta = 0.0
+    if wallet_index < len(pre_sol) and wallet_index < len(post_sol):
+        sol_delta = (float(post_sol[wallet_index]) - float(pre_sol[wallet_index])) / 1e9
 
-    tokens_in = []  # tokens received by the wallet
-    tokens_out = []  # tokens sent from the wallet
+    pre_tokens = {b.get("mint", ""): _token_amount(b)
+                  for b in (meta.get("preTokenBalances") or [])
+                  if b.get("owner") == wallet_address and b.get("mint")}
+    post_tokens = {b.get("mint", ""): _token_amount(b)
+                   for b in (meta.get("postTokenBalances") or [])
+                   if b.get("owner") == wallet_address and b.get("mint")}
+    deltas = {mint: post_tokens.get(mint, 0) - pre_tokens.get(mint, 0)
+              for mint in set(pre_tokens) | set(post_tokens)}
+    positives = [(mint, delta) for mint, delta in deltas.items() if delta > 0]
+    negatives = [(mint, delta) for mint, delta in deltas.items() if delta < 0]
+    token_in = max(positives, key=lambda item: item[1])[0] if positives else ""
+    token_out = min(negatives, key=lambda item: item[1])[0] if negatives else ""
+    timestamp = tx.get("blockTime", 0) or 0
 
-    for t in token_transfers:
-        mint = t.get("mint", "")
-        if mint == SOL_MINT:
-            continue  # skip wrapped SOL transfers, handled separately
-        if t.get("toUserAccount") == wallet_address:
-            tokens_in.append(mint)
-        elif t.get("fromUserAccount") == wallet_address:
-            tokens_out.append(mint)
-
-    # Check native SOL transfers
-    sol_spent = 0
-    for nt in native_transfers:
-        if nt.get("fromUserAccount") == wallet_address:
-            sol_spent += nt.get("amount", 0)
-
-    # A buy = SOL out, token in
-    if tokens_in and sol_spent > 0:
-        return {
-            "token_bought": tokens_in[0],
-            "token_sold": SOL_MINT,
-            "amount_sol": sol_spent / 1e9,
-            "signature": sig,
-            "timestamp": timestamp,
-        }
-
-    # A sell = token out, SOL in (or another token in)
-    if tokens_out and not tokens_in:
-        return {
-            "token_bought": SOL_MINT,
-            "token_sold": tokens_out[0],
-            "amount_sol": 0,
-            "signature": sig,
-            "timestamp": timestamp,
-        }
-
-    # Token-to-token swap
-    if tokens_in and tokens_out:
-        return {
-            "token_bought": tokens_in[0],
-            "token_sold": tokens_out[0],
-            "amount_sol": 0,
-            "signature": sig,
-            "timestamp": timestamp,
-        }
-
+    if token_in and token_out:
+        return {"token_bought": token_in, "token_sold": token_out,
+                "amount_sol": 0, "signature": signature, "timestamp": timestamp}
+    if token_in and sol_delta < 0:
+        return {"token_bought": token_in, "token_sold": SOL_MINT,
+                "amount_sol": abs(sol_delta), "signature": signature, "timestamp": timestamp}
+    if token_out and sol_delta > 0:
+        return {"token_bought": SOL_MINT, "token_sold": token_out,
+                "amount_sol": sol_delta, "signature": signature, "timestamp": timestamp}
     return None
 
 
@@ -342,10 +305,6 @@ async def poll_tracked_wallets(on_new_buy, on_wallet_sell=None) -> None:
     on_new_buy: async callback(wallet_address, token_address, confidence, signature)
     on_wallet_sell: async callback(wallet_address, token_address, signature) or None
     """
-    if not config.HELIUS_API_KEY:
-        logger.warning("[WALLET] No HELIUS_API_KEY -- wallet tracker disabled")
-        return
-
     logger.info("[WALLET] Tracker started with %d wallets", get_wallet_count())
 
     while True:
@@ -430,8 +389,6 @@ def seed_default_wallets() -> None:
 
 # -- Auto-Discovery: find alpha wallets from tokens that pumped --
 
-HELIUS_TOKEN_ACCOUNTS_URL = f"https://api.helius.xyz/v0/token-metadata?api-key={config.HELIUS_API_KEY}"
-HELIUS_SIGNATURES_URL = "https://api.helius.xyz/v0/addresses/{address}/transactions"
 BIRDEYE_TXS_URL = "https://public-api.birdeye.so/defi/txs/token"
 SOLSCAN_TRANSFERS_URL = "https://api.solscan.io/v2/account/transfer"
 
@@ -446,28 +403,6 @@ def _get_from_url(url: str, params: dict, headers: dict | None = None, timeout: 
         return resp
     except Exception:
         return None
-
-
-def _fetch_early_buyers_helius(token_address: str, limit: int) -> list[str] | None:
-    """Fetch early buyers via Helius. Returns None if rate-limited."""
-    if not config.HELIUS_API_KEY:
-        return None
-    url = HELIUS_SIGNATURES_URL.format(address=token_address)
-    resp = _get_from_url(url, params={"api-key": config.HELIUS_API_KEY, "limit": 100, "type": "SWAP"})
-    if resp is None:
-        return None
-    buyers, seen = [], set()
-    for tx in resp.json():
-        for t in (tx.get("tokenTransfers") or []):
-            if t.get("mint") != token_address:
-                continue
-            addr = t.get("toUserAccount", "")
-            if addr and addr not in seen and addr != token_address:
-                seen.add(addr)
-                buyers.append(addr)
-                if len(buyers) >= limit:
-                    return buyers
-    return buyers
 
 
 def _fetch_early_buyers_birdeye(token_address: str, limit: int) -> list[str] | None:
@@ -525,9 +460,8 @@ def _fetch_early_buyers_solscan(token_address: str, limit: int) -> list[str] | N
 
 
 def _fetch_early_buyers(token_address: str, limit: int = 30) -> list[str]:
-    """Fetch earliest buyer wallets using Helius → Birdeye → Solscan fallback chain."""
+    """Fetch earliest buyer wallets using Birdeye → Solscan fallbacks."""
     for provider_fn, name in [
-        (_fetch_early_buyers_helius, "Helius"),
         (_fetch_early_buyers_birdeye, "Birdeye"),
         (_fetch_early_buyers_solscan, "Solscan"),
     ]:
@@ -543,13 +477,10 @@ def _fetch_early_buyers(token_address: str, limit: int = 30) -> list[str]:
 
 
 def _score_wallet(wallet_address: str) -> dict | None:
-    """Evaluate a wallet's recent trading performance using Helius.
+    """Evaluate a wallet's recent trading performance using Solana RPC.
 
     Returns {win_rate, total_trades, winning_trades, avg_return} or None.
     """
-    if not config.HELIUS_API_KEY:
-        return None
-
     swaps = fetch_recent_swaps(wallet_address, limit=50)
     if len(swaps) < 5:
         return None  # Too few trades to evaluate
@@ -617,7 +548,7 @@ def discover_alpha_wallets() -> list[dict]:
 
     Flow:
     1. Find tokens from alert_outcomes that gained 50%+ at 1h or 100%+ max_24h
-    2. Fetch their early buyers via Helius
+    2. Fetch their early buyers via Birdeye/Solscan
     3. Count how many winning tokens each wallet appeared in
     4. Score wallets that appear in 2+ winners
     5. Add qualifying wallets (WR >50%) to tracked list
@@ -689,7 +620,7 @@ def discover_alpha_wallets() -> list[dict]:
         if addr in existing:
             continue
 
-        # Quick score via Helius
+        # Quick score via multi-provider Solana RPC
         stats = _score_wallet(addr)
         if stats is None:
             continue
@@ -814,17 +745,13 @@ def discover_from_trending() -> list[dict]:
     Flow:
     1. Fetch top gaining Solana tokens from DexScreener
     2. Filter for memecoin characteristics (low MC, recent, high volume)
-    3. Fetch early buyers of each via Helius
+    3. Fetch early buyers of each via Birdeye/Solscan
     4. Score wallets appearing in 2+ different top gainers
     5. Add qualifying wallets
 
     Returns list of newly added wallets.
     """
     import dexscreener_client as dex
-
-    if not config.HELIUS_API_KEY:
-        logger.warning("[DISCOVERY] No HELIUS_API_KEY")
-        return []
 
     # Step 1: Fetch trending Solana tokens from DexScreener
     logger.info("[DISCOVERY] Fetching trending Solana tokens from DexScreener...")
