@@ -524,43 +524,48 @@ def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | N
         logger.warning("[TRADE] Sell blocked: no token amount")
         return None
 
-    # Try sell with normal slippage, then retry with higher if it fails
-    for attempt, slippage_mult in enumerate([1.0, 2.0, 3.0], 1):
-        extra_bps = int(config.TRADE_SLIPPAGE_BPS * slippage_mult)
-        quote = _get_sell_quote_with_slippage(token_mint, token_amount, extra_bps)
-        if quote is None:
-            if attempt < 3:
-                logger.warning("[TRADE] Sell quote failed (attempt %d/3), retrying with higher slippage", attempt)
-                time.sleep(1)
-                continue
-            return None
-
-        result = execute_swap(quote)
-        if result is not None:
-            if attempt > 1:
-                logger.info("[TRADE] Sell succeeded on attempt %d with %d bps slippage", attempt, extra_bps)
-            break
-
-        if attempt < 3:
-            logger.warning("[TRADE] Sell swap failed (attempt %d/3), retrying with higher slippage", attempt)
-            time.sleep(1)
-    else:
-        logger.error("[TRADE] Sell failed after 3 attempts for %s", token_mint[:16])
+    if not storage.claim_position_for_sell(position_id):
+        logger.warning("[TRADE] Sell blocked: position #%d is not open", position_id)
         return None
 
-    # Calculate SOL received
-    sol_received = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL
+    completed = False
+    try:
+        # Try sell with normal slippage, then retry with higher if it fails
+        for attempt, slippage_mult in enumerate([1.0, 2.0, 3.0], 1):
+            extra_bps = int(config.TRADE_SLIPPAGE_BPS * slippage_mult)
+            quote = _get_sell_quote_with_slippage(token_mint, token_amount, extra_bps)
+            if quote is None:
+                if attempt < 3:
+                    logger.warning("[TRADE] Sell quote failed (attempt %d/3), retrying with higher slippage", attempt)
+                    time.sleep(1)
+                    continue
+                return None
 
-    # Close the position in DB
-    storage.close_position(position_id, sol_received, result["signature"])
+            result = execute_swap(quote)
+            if result is not None:
+                if attempt > 1:
+                    logger.info("[TRADE] Sell succeeded on attempt %d with %d bps slippage", attempt, extra_bps)
+                break
 
-    result["sol_received"] = sol_received
-    result["position_id"] = position_id
-    result["token_mint"] = token_mint
+            if attempt < 3:
+                logger.warning("[TRADE] Sell swap failed (attempt %d/3), retrying with higher slippage", attempt)
+                time.sleep(1)
+        else:
+            logger.error("[TRADE] Sell failed after 3 attempts for %s", token_mint[:16])
+            return None
 
-    logger.info("[TRADE] Sold position #%d (%s) for %.4f SOL (sig=%s)",
-                position_id, token_mint[:16], sol_received, result["signature"][:16])
-    return result
+        sol_received = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL
+        storage.close_position(position_id, sol_received, result["signature"])
+        completed = True
+        result["sol_received"] = sol_received
+        result["position_id"] = position_id
+        result["token_mint"] = token_mint
+        logger.info("[TRADE] Sold position #%d (%s) for %.4f SOL (sig=%s)",
+                    position_id, token_mint[:16], sol_received, result["signature"][:16])
+        return result
+    finally:
+        if not completed:
+            storage.release_position_sell(position_id)
 
 
 def sell_partial(position_id: int, token_mint: str, token_amount: int, sell_pct: float) -> dict | None:
@@ -575,28 +580,31 @@ def sell_partial(position_id: int, token_mint: str, token_amount: int, sell_pct:
     if sell_amount <= 0:
         return None
 
-    quote = get_sell_quote(token_mint, sell_amount)
-    if quote is None:
+    if not storage.claim_position_for_sell(position_id):
         return None
 
-    result = execute_swap(quote)
-    if result is None:
-        return None
-
-    sol_received = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL
-    remaining = token_amount - sell_amount
-
-    # Update position: reduce token_amount, don't close
-    storage.update_position_tokens(position_id, remaining)
-
-    result["sol_received"] = sol_received
-    result["sold_amount"] = sell_amount
-    result["remaining"] = remaining
-    result["sell_pct"] = sell_pct
-
-    logger.info("[TRADE] Partial sell #%d: %.0f%% sold, %.4f SOL received, %d tokens remaining",
-                position_id, sell_pct, sol_received, remaining)
-    return result
+    completed = False
+    try:
+        quote = get_sell_quote(token_mint, sell_amount)
+        if quote is None:
+            return None
+        result = execute_swap(quote)
+        if result is None:
+            return None
+        sol_received = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL
+        remaining = token_amount - sell_amount
+        storage.update_position_tokens(position_id, remaining)
+        completed = True
+        result["sol_received"] = sol_received
+        result["sold_amount"] = sell_amount
+        result["remaining"] = remaining
+        result["sell_pct"] = sell_pct
+        logger.info("[TRADE] Partial sell #%d: %.0f%% sold, %.4f SOL received, %d tokens remaining",
+                    position_id, sell_pct, sol_received, remaining)
+        return result
+    finally:
+        if not completed:
+            storage.release_position_sell(position_id)
 
 
 def check_position_pnl(position: dict) -> dict | None:

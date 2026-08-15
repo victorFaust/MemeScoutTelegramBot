@@ -482,6 +482,33 @@ def get_position_by_id(position_id: int) -> dict | None:
         conn.close()
 
 
+def claim_position_for_sell(position_id: int) -> bool:
+    """Atomically reserve an open position so only one sell can execute."""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE positions SET status = 'selling' WHERE id = ? AND status = 'open'",
+            (position_id,),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def release_position_sell(position_id: int) -> None:
+    """Return a failed sell reservation to the open state."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE positions SET status = 'open' WHERE id = ? AND status = 'selling'",
+            (position_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def update_tx_status(position_id: int, status: str) -> None:
     """Update the transaction confirmation status of a position."""
     conn = _connect()
@@ -533,7 +560,7 @@ def update_position_tokens(position_id: int, new_token_amount: int) -> None:
             )
         else:
             conn.execute(
-                "UPDATE positions SET token_amount = ? WHERE id = ?",
+                "UPDATE positions SET token_amount = ?, status = 'open' WHERE id = ?",
                 (new_token_amount, position_id),
             )
         conn.commit()
