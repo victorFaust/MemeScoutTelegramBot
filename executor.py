@@ -163,7 +163,7 @@ def get_all_wallet_addresses() -> list[str]:
     return [str(kp.pubkey()) for kp in _get_all_keypairs()]
 
 
-def _dynamic_slippage(token_mint: str, amount_sol: float) -> int:
+def _dynamic_slippage(token_mint: str, amount_sol: float, base_slippage: int | None = None) -> int:
     """Calculate slippage BPS based on token liquidity and trade size.
 
     Low liquidity or large relative trade size → higher slippage.
@@ -171,7 +171,7 @@ def _dynamic_slippage(token_mint: str, amount_sol: float) -> int:
     """
     import dexscreener_client as dex
 
-    base_slippage = config.TRADE_SLIPPAGE_BPS  # default from config
+    base_slippage = base_slippage or config.TRADE_SLIPPAGE_BPS
 
     try:
         pairs = dex.fetch_pair_details("solana", token_mint)
@@ -298,7 +298,7 @@ def _submit_rpc(signed_tx_b64: str) -> dict | None:
     return str(kp.pubkey())
 
 
-def get_quote(token_mint: str, amount_sol: float | None = None) -> dict | None:
+def get_quote(token_mint: str, amount_sol: float | None = None, slippage_bps: int | None = None) -> dict | None:
     """Get a Jupiter swap quote for SOL -> token.
     
     Returns quote dict with expected output, price impact, route info.
@@ -308,7 +308,7 @@ def get_quote(token_mint: str, amount_sol: float | None = None) -> dict | None:
         amount_sol = config.TRADE_AMOUNT_SOL
 
     amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
-    slippage = _dynamic_slippage(token_mint, amount_sol)
+    slippage = _dynamic_slippage(token_mint, amount_sol, slippage_bps)
 
     try:
         resp = requests.get(JUPITER_QUOTE_URL, params={
@@ -380,6 +380,11 @@ def execute_swap(quote: dict, wallet_address: str | None = None) -> dict | None:
             logger.debug("[TRADE] Using wallet %d/%d for this swap", (_wallet_index - 1) % len(pool) + 1, len(pool))
 
     wallet_address = str(kp.pubkey())
+    profile = storage.get_wallet_profile(wallet_address)
+    mev_enabled = bool(profile.get("mev_protection", 1))
+    priority = int(profile.get("priority_fee_lamports", 100000))
+    jito_tip = int(profile.get("jito_tip_lamports", JITO_TIP_LAMPORTS))
+    fee_setting: Any = {"jitoTipLamports": jito_tip} if mev_enabled else priority
 
     # Get swap transaction from Jupiter
     try:
@@ -388,7 +393,7 @@ def execute_swap(quote: dict, wallet_address: str | None = None) -> dict | None:
             "userPublicKey": wallet_address,
             "wrapAndUnwrapSol": True,
             "dynamicComputeUnitLimit": True,
-            "prioritizationFeeLamports": "auto",
+            "prioritizationFeeLamports": fee_setting,
         }, timeout=15)
         resp.raise_for_status()
         swap_data = resp.json()
@@ -418,10 +423,11 @@ def execute_swap(quote: dict, wallet_address: str | None = None) -> dict | None:
         return None
 
     # Try Jito bundle first (MEV-protected)
-    result = _submit_jito_bundle(signed_b64)
-    if result:
-        result["wallet_address"] = wallet_address
-        return result
+    if mev_enabled:
+        result = _submit_jito_bundle(signed_b64)
+        if result:
+            result["wallet_address"] = wallet_address
+            return result
 
     # Fallback to regular RPC
     logger.info("[TRADE] Jito bundle failed, falling back to regular RPC")
@@ -489,8 +495,16 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
         logger.warning("[TRADE] Buy blocked: amount would exceed daily limit")
         return None
 
-    # Get quote
-    quote = get_quote(token_mint, amount_sol)
+    pool = _get_all_keypairs()
+    if not pool:
+        return None
+    global _wallet_index
+    buy_wallet = str(pool[_wallet_index % len(pool)].pubkey())
+    _wallet_index += 1
+    profile = storage.get_wallet_profile(buy_wallet)
+
+    # Get quote using the selected wallet's execution profile.
+    quote = get_quote(token_mint, amount_sol, int(profile.get("slippage_bps", config.TRADE_SLIPPAGE_BPS)))
     if quote is None:
         return None
 
@@ -501,7 +515,7 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
         return None
 
     # Execute
-    result = execute_swap(quote)
+    result = execute_swap(quote, wallet_address=buy_wallet)
     if result is None:
         return None
 
@@ -573,9 +587,13 @@ def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | N
 
     completed = False
     try:
+        position = storage.get_position_by_id(position_id) or {}
+        owner_wallet = position.get("wallet_address") or get_wallet_address()
+        profile = storage.get_wallet_profile(owner_wallet or "")
+        base_slippage = int(profile.get("slippage_bps", config.TRADE_SLIPPAGE_BPS))
         # Try sell with normal slippage, then retry with higher if it fails
         for attempt, slippage_mult in enumerate([1.0, 2.0, 3.0], 1):
-            extra_bps = int(config.TRADE_SLIPPAGE_BPS * slippage_mult)
+            extra_bps = min(5000, int(base_slippage * slippage_mult))
             quote = _get_sell_quote_with_slippage(token_mint, token_amount, extra_bps)
             if quote is None:
                 if attempt < 3:
@@ -584,8 +602,6 @@ def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | N
                     continue
                 return None
 
-            position = storage.get_position_by_id(position_id) or {}
-            owner_wallet = position.get("wallet_address") or get_wallet_address()
             result = execute_swap(quote, wallet_address=owner_wallet)
             if result is not None:
                 if attempt > 1:
@@ -630,11 +646,14 @@ def sell_partial(position_id: int, token_mint: str, token_amount: int, sell_pct:
 
     completed = False
     try:
-        quote = get_sell_quote(token_mint, sell_amount)
-        if quote is None:
-            return None
         position = storage.get_position_by_id(position_id) or {}
         owner_wallet = position.get("wallet_address") or get_wallet_address()
+        profile = storage.get_wallet_profile(owner_wallet or "")
+        quote = _get_sell_quote_with_slippage(
+            token_mint, sell_amount, int(profile.get("slippage_bps", config.TRADE_SLIPPAGE_BPS))
+        )
+        if quote is None:
+            return None
         result = execute_swap(quote, wallet_address=owner_wallet)
         if result is None:
             return None

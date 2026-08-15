@@ -62,33 +62,42 @@ async def _safe_edit_message(query, text: str, reply_markup=None) -> None:
 
 def _main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Portfolio", callback_data="menu:positions"),
-         InlineKeyboardButton("Trades", callback_data="menu:trades")],
-        [InlineKeyboardButton("Wallet", callback_data="menu:wallet"),
-         InlineKeyboardButton("Watchlist", callback_data="menu:watchlist")],
-        [InlineKeyboardButton("Settings", callback_data="menu:settings"),
-         InlineKeyboardButton("Stop Trading", callback_data="menu:stop")],
-        [InlineKeyboardButton("Auto-Buy: " + ("ON" if config.AUTO_BUY_ENABLED else "OFF"), callback_data="menu:autobuy")],
+        [InlineKeyboardButton("🟢 Buy", callback_data="menu:buy"),
+         InlineKeyboardButton("🔴 Sell", callback_data="menu:positions")],
+        [InlineKeyboardButton("📊 Positions", callback_data="menu:positions"),
+         InlineKeyboardButton("🎯 Orders", callback_data="menu:orders")],
+        [InlineKeyboardButton("👛 Wallets", callback_data="menu:wallet"),
+         InlineKeyboardButton("⚙️ Profiles", callback_data="menu:profiles")],
+        [InlineKeyboardButton("👁 Watchlist", callback_data="menu:watchlist"),
+         InlineKeyboardButton("📜 History", callback_data="menu:trades")],
+        [InlineKeyboardButton("🤖 Auto-Buy: " + ("ON" if config.AUTO_BUY_ENABLED else "OFF"), callback_data="menu:autobuy"),
+         InlineKeyboardButton("🚨 Stop", callback_data="menu:stop")],
     ])
 
 
 async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show main menu."""
+    if not _is_authorized(update):
+        if update.message:
+            await update.message.reply_text("Not authorized")
+        return
     wallet = executor.get_wallet_address()
     balance = executor.get_wallet_balance()
     positions = storage.get_open_positions_count()
+    active_orders = len(storage.get_active_trade_orders())
+    mismatches = sum(1 for p in storage.get_open_positions()
+                     if p.get("reconciliation_status") in {"balance_missing", "balance_mismatch"})
 
     wallet_str = f"{wallet[:6]}...{wallet[-4:]}" if wallet else "Not set"
     bal_str = f"{balance['sol']:.4f} SOL (${balance['usd']:.2f})" if balance else "N/A"
 
     text = (
-        "MemeScout Bot\n"
+        "⚡ MEMESCOUT TRADING\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"Wallet: {wallet_str}\n"
-        f"Balance: {bal_str}\n"
-        f"Open Positions: {positions}/{config.MAX_OPEN_POSITIONS}\n"
-        f"Trading: {'ON' if config.TRADING_ENABLED else 'OFF'}\n"
-        f"Auto-Buy: {'ON' if config.AUTO_BUY_ENABLED else 'OFF'} (${config.AUTO_BUY_AMOUNT_USD:.0f})\n"
+        f"👛 {wallet_str} · {bal_str}\n"
+        f"📊 {positions}/{config.MAX_OPEN_POSITIONS} positions · 🎯 {active_orders} orders\n"
+        f"Trading {'🟢 ON' if config.TRADING_ENABLED else '🔴 OFF'} · Auto {'🟢 ON' if config.AUTO_BUY_ENABLED else '⚪ OFF'}\n"
+        + (f"⚠️ {mismatches} balance mismatch(es) need review\n" if mismatches else "✅ Portfolio reconciled\n") +
         "━━━━━━━━━━━━━━━━━━"
     )
 
@@ -106,9 +115,14 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if not query or not query.data:
         return
 
+    if not _is_authorized(update):
+        logger.warning("[BOT] Unauthorized menu access blocked")
+        await query.answer("Not authorized", show_alert=True)
+        return
+
     action = query.data.split(":", 1)[1] if ":" in query.data else query.data
-    if (action in {"sellall", "stop", "autobuy", "autobuy_pools"}
-            or action.startswith("sell_") or action.startswith("set_amount_")):
+    if (action in {"sellall", "sellallconfirm", "stop", "autobuy", "autobuy_pools"}
+            or action.startswith(("sell_", "set_amount_", "cancelorder_"))):
         if not _is_authorized(update):
             logger.warning("[BOT] Unauthorized menu action blocked: %s", action)
             await query.answer("Not authorized", show_alert=True)
@@ -118,6 +132,12 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "positions":
         await _show_positions(query)
+    elif action == "buy":
+        await _show_buy(query)
+    elif action == "orders":
+        await _show_orders(query)
+    elif action == "profiles":
+        await _show_profiles(query)
     elif action == "trades":
         await _show_trades(query)
     elif action.startswith("trade_"):
@@ -132,6 +152,15 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == "settings":
         await _show_settings(query)
     elif action == "sellall":
+        positions = [p for p in storage.get_open_positions() if _position_is_sellable(p)]
+        await query.edit_message_text(
+            f"⚠️ Sell all {len(positions)} confirmed position(s)?\nThis submits on-chain market sells and cannot be undone.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Confirm Sell All", callback_data="menu:sellallconfirm")],
+                [InlineKeyboardButton("Cancel", callback_data="menu:positions")],
+            ]),
+        )
+    elif action == "sellallconfirm":
         await _sell_all(query)
     elif action == "stop":
         await _stop_trading(query)
@@ -151,6 +180,59 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
         addr = action[8:]
         storage.remove_from_watchlist(addr)
         await _show_watchlist(query)
+    elif action.startswith("cancelorder_"):
+        order_id = int(action.split("_")[1])
+        storage.cancel_trade_order(order_id)
+        await _show_orders(query)
+
+
+async def _show_buy(query) -> None:
+    await query.edit_message_text(
+        "🟢 BUY\n━━━━━━━━━━━━━━━━━━\n"
+        "Market: /buy <token> $amount\n"
+        "Limit: /limitbuy <token> <price_usd> $amount\n\n"
+        "Alert cards also provide quick-buy presets. Orders remain active across restarts.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Dashboard", callback_data="menu:back")]]),
+    )
+
+
+async def _show_orders(query) -> None:
+    orders = storage.get_trade_orders(limit=20)
+    lines = ["🎯 ORDERS", "━━━━━━━━━━━━━━━━━━"]
+    buttons = []
+    if not orders:
+        lines.append("No orders yet.\nUse /limitbuy or open a confirmed position to create exits.")
+    for order in orders:
+        symbol = order.get("token_symbol") or order["token_address"][:8]
+        kind = order["order_type"].replace("_", " ").title()
+        trigger = order["trigger_value"]
+        trigger_text = f"${trigger:.10g}" if order["order_type"] == "limit_buy" else f"{trigger:+.0f}%"
+        icon = {"active": "🟢", "executing": "🟡", "completed": "✅", "cancelled": "⚪"}.get(order["status"], "⚠️")
+        lines.append(f"{icon} #{order['id']} {kind} · ${symbol} · {trigger_text}")
+        if order["status"] == "active":
+            buttons.append(InlineKeyboardButton(f"Cancel #{order['id']}", callback_data=f"menu:cancelorder_{order['id']}"))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="menu:orders"),
+                 InlineKeyboardButton("⬅️ Dashboard", callback_data="menu:back")])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _show_profiles(query) -> None:
+    wallets = executor.get_all_wallet_addresses()
+    lines = ["⚙️ EXECUTION PROFILES", "━━━━━━━━━━━━━━━━━━"]
+    if not wallets:
+        lines.append("No trading wallet configured.")
+    for index, wallet in enumerate(wallets, 1):
+        profile = storage.get_wallet_profile(wallet)
+        lines += [
+            f"W{index} · {wallet[:6]}...{wallet[-4:]}",
+            f"  Slippage {profile['slippage_bps']/100:.1f}% · Priority {profile['priority_fee_lamports']} lamports",
+            f"  MEV {'ON' if profile['mev_protection'] else 'OFF'} · Jito tip {profile['jito_tip_lamports']} · Buys ${profile['buy_presets_usd']}",
+        ]
+    lines += ["", "Edit: /profile <wallet#> <slippage%> <priority> <jito_tip> <on|off> [presets]"]
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Dashboard", callback_data="menu:back")
+    ]]))
 
 
 async def _send_positions(target, text: str, reply_markup) -> None:
@@ -166,7 +248,7 @@ def _position_is_sellable(position: dict) -> bool:
     return (
         position.get("status") == "open"
         and (position.get("token_amount", 0) or 0) > 0
-        and position.get("tx_status", "confirmed") not in {"pending", "failed", "no_sig"}
+        and position.get("tx_status", "confirmed") in {"confirmed", "finalized"}
     )
 
 
@@ -297,6 +379,9 @@ async def _show_positions(target) -> None:
 
 async def _handle_positions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open the portfolio directly for /positions."""
+    if update.message and not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
     if update.message:
         await _show_positions(update.message)
 
@@ -901,6 +986,139 @@ async def _handle_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Buy failed")
 
 
+async def _handle_limitbuy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Create a persistent limit buy: /limitbuy <mint> <price_usd> <$amount>."""
+    if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text("Usage: /limitbuy <token_address> <price_usd> $5")
+        return
+    mint = context.args[0]
+    if not _is_valid_solana_address(mint):
+        await update.message.reply_text("Invalid Solana token address")
+        return
+    try:
+        target_price = float(context.args[1].replace("$", ""))
+        usd = float(context.args[2].replace("$", "").replace(",", ""))
+    except ValueError:
+        await update.message.reply_text("Price and amount must be numbers")
+        return
+    if target_price <= 0 or not MIN_BUY_USD <= usd <= MAX_BUY_USD:
+        await update.message.reply_text("Price must be positive and amount must be $0.50 - $100")
+        return
+    amount_sol = executor.usd_to_sol(usd)
+    if amount_sol <= 0:
+        await update.message.reply_text("SOL price is unavailable. Please try again shortly.")
+        return
+    order_id = storage.create_trade_order(
+        mint, "limit_buy", target_price, amount_sol=amount_sol
+    )
+    await update.message.reply_text(
+        f"🎯 Limit buy #{order_id} created\nTrigger: ${target_price:.10g}\nSpend: ${usd:.2f} ({amount_sol:.4f} SOL)\nUse /orders to manage it."
+    )
+
+
+async def _handle_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
+    orders = storage.get_trade_orders(limit=20)
+    if not orders:
+        await update.message.reply_text("No orders. Use /limitbuy to create one.")
+        return
+    lines = ["🎯 ORDERS", "━━━━━━━━━━━━━━━━━━"]
+    for order in orders:
+        symbol = order.get("token_symbol") or order["token_address"][:8]
+        trigger = (f"${order['trigger_value']:.10g}" if order["order_type"] == "limit_buy"
+                   else f"{order['trigger_value']:+.0f}%")
+        lines.append(f"#{order['id']} · {order['order_type'].replace('_', ' ')} · ${symbol} · {trigger} · {order['status']}")
+    lines.append("\nCancel: /cancelorder <id>")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _handle_cancelorder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
+    try:
+        order_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /cancelorder <id>")
+        return
+    message = f"Order #{order_id} cancelled" if storage.cancel_trade_order(order_id) else f"Active order #{order_id} not found"
+    await update.message.reply_text(message)
+
+
+async def _handle_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View or update a wallet execution profile."""
+    if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
+    wallets = executor.get_all_wallet_addresses()
+    if len(context.args) < 5:
+        await update.message.reply_text(
+            "Usage: /profile <wallet#> <slippage%> <priority_lamports> <jito_tip> <on|off> [buy_presets]\n"
+            "Example: /profile 1 5 100000 10000 on 1,2,3,5"
+        )
+        return
+    try:
+        wallet_index = int(context.args[0]) - 1
+        slippage_pct = float(context.args[1])
+        priority = int(context.args[2])
+        jito_tip = int(context.args[3])
+        mev = context.args[4].lower() in {"on", "true", "1", "yes"}
+        wallet = wallets[wallet_index]
+    except (ValueError, IndexError):
+        await update.message.reply_text("Invalid wallet number or numeric setting")
+        return
+    if not 0.1 <= slippage_pct <= 50 or not 0 <= priority <= 10_000_000 or not 0 <= jito_tip <= 10_000_000:
+        await update.message.reply_text("Slippage must be 0.1-50%; fees must be 0-10,000,000 lamports")
+        return
+    presets = context.args[5] if len(context.args) > 5 else storage.get_wallet_profile(wallet)["buy_presets_usd"]
+    try:
+        preset_values = [float(value) for value in presets.split(",")]
+        if not preset_values or any(not MIN_BUY_USD <= value <= MAX_BUY_USD for value in preset_values):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Presets must be comma-separated amounts from $0.50 to $100")
+        return
+    profile = storage.update_wallet_profile(
+        wallet, slippage_bps=round(slippage_pct * 100), priority_fee_lamports=priority,
+        jito_tip_lamports=jito_tip, mev_protection=int(mev), buy_presets_usd=presets,
+    )
+    await update.message.reply_text(
+        f"✅ W{wallet_index + 1} profile saved\nSlippage {profile['slippage_bps']/100:.1f}% · MEV {'ON' if mev else 'OFF'}"
+    )
+
+
+async def _handle_autobuy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not _is_authorized(update):
+        if update.message:
+            await update.message.reply_text("Not authorized")
+        return
+    config.AUTO_BUY_ENABLED = not config.AUTO_BUY_ENABLED
+    await update.message.reply_text(f"Auto-buy is now {'ON' if config.AUTO_BUY_ENABLED else 'OFF'}")
+
+
+async def _handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not _is_authorized(update):
+        if update.message:
+            await update.message.reply_text("Not authorized")
+        return
+    config.TRADING_ENABLED = False
+    config.AUTO_BUY_ENABLED = False
+    await update.message.reply_text("🚨 Trading stopped. Buys, sells, and order execution are disabled.")
+
+
 async def _handle_bot_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Global error hook so callback failures are always visible in logs."""
     logger.exception("[BOT] Unhandled exception in update handler", exc_info=context.error)
@@ -909,6 +1127,9 @@ async def _handle_bot_error(update: object, context: ContextTypes.DEFAULT_TYPE) 
 async def _handle_trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /trades command — show trade history inline."""
     if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
         return
 
     pending = storage.get_pending_positions()
@@ -1133,6 +1354,15 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
     """Handle /report [days] — send performance report to Telegram."""
     if not update.message:
         return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
 
     days = 7
     if context.args:
@@ -1336,6 +1566,9 @@ async def _handle_watch_command(update: Update, context: ContextTypes.DEFAULT_TY
     """Handle /watch <token_address> — add token to watchlist."""
     if not update.message:
         return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /watch <token_address>")
@@ -1368,6 +1601,9 @@ async def _handle_watch_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def _handle_addwallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /addwallet <address> [label] [win_rate]."""
     if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
         return
     args = context.args
     if not args:
@@ -1404,6 +1640,9 @@ async def _handle_wallets_command(update: Update, context: ContextTypes.DEFAULT_
     """Handle /wallets — show all tracked wallets."""
     if not update.message:
         return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
 
     import wallet_tracker
 
@@ -1434,6 +1673,9 @@ async def _handle_rmwallet_command(update: Update, context: ContextTypes.DEFAULT
     """Handle /rmwallet <address>."""
     if not update.message:
         return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /rmwallet <address>")
@@ -1449,6 +1691,9 @@ async def _handle_rmwallet_command(update: Update, context: ContextTypes.DEFAULT
 async def _handle_clearwallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /clearwallets — remove all tracked wallets."""
     if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
         return
 
     import wallet_tracker
@@ -1521,7 +1766,11 @@ async def start_bot_handler() -> None:
         BotCommand("report", "Performance report: /report [days]"),
         BotCommand("pnl", "PnL dashboard: today, 7d, open positions"),
         BotCommand("buy", "Buy token: /buy <address> $5"),
+        BotCommand("limitbuy", "Create persistent limit buy"),
         BotCommand("sell", "Sell: /sell <id> or /sell all"),
+        BotCommand("orders", "View persistent orders"),
+        BotCommand("cancelorder", "Cancel order: /cancelorder <id>"),
+        BotCommand("profile", "Configure wallet execution profile"),
         BotCommand("watch", "Watch token: /watch <address>"),
         BotCommand("wallets", "View tracked wallets"),
         BotCommand("addwallet", "Track wallet: /addwallet <addr> [label] [wr%]"),
@@ -1538,20 +1787,18 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("report", _handle_report_command))
     app.add_handler(CommandHandler("pnl", _handle_pnl_command))
     app.add_handler(CommandHandler("buy", _handle_buy_command))
+    app.add_handler(CommandHandler("limitbuy", _handle_limitbuy_command))
     app.add_handler(CommandHandler("sell", _handle_sell_command))
+    app.add_handler(CommandHandler("orders", _handle_orders_command))
+    app.add_handler(CommandHandler("cancelorder", _handle_cancelorder_command))
+    app.add_handler(CommandHandler("profile", _handle_profile_command))
     app.add_handler(CommandHandler("watch", _handle_watch_command))
     app.add_handler(CommandHandler("addwallet", _handle_addwallet_command))
     app.add_handler(CommandHandler("wallets", _handle_wallets_command))
     app.add_handler(CommandHandler("rmwallet", _handle_rmwallet_command))
     app.add_handler(CommandHandler("clearwallets", _handle_clearwallets_command))
-    app.add_handler(CommandHandler("autobuy", lambda u, c: u.message.reply_text(
-        f"Auto-buy: {'ON -> OFF' if config.AUTO_BUY_ENABLED else 'OFF -> ON'}",
-    ) if (setattr(config, 'AUTO_BUY_ENABLED', not config.AUTO_BUY_ENABLED) or True) else None))
-    app.add_handler(CommandHandler("stop", lambda u, c: (
-        setattr(config, 'TRADING_ENABLED', False),
-        setattr(config, 'AUTO_BUY_ENABLED', False),
-        u.message.reply_text("STOPPED. All trading disabled.")
-    )[-1]))
+    app.add_handler(CommandHandler("autobuy", _handle_autobuy_command))
+    app.add_handler(CommandHandler("stop", _handle_stop_command))
     app.add_handler(CallbackQueryHandler(_handle_buy_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_text_input))
     app.add_error_handler(_handle_bot_error)

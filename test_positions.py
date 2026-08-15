@@ -85,8 +85,9 @@ class PositionRenderingTests(unittest.IsolatedAsyncioTestCase):
         callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
         self.assertIn("menu:sell_2", callbacks)
 
+    @patch("bot_handler._is_authorized", return_value=True)
     @patch("bot_handler._show_positions", new_callable=AsyncMock)
-    async def test_positions_command_opens_portfolio_directly(self, show_positions):
+    async def test_positions_command_opens_portfolio_directly(self, show_positions, _authorized):
         message = AsyncMock()
         update = Mock(message=message)
         await bot_handler._handle_positions_command(update, None)

@@ -118,6 +118,17 @@ ON trade_orders(status, order_type, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_orders_exit_unique
 ON trade_orders(position_id, order_type, trigger_value)
 WHERE position_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS wallet_profiles (
+    wallet_address TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT 'Default',
+    slippage_bps INTEGER NOT NULL DEFAULT 500,
+    priority_fee_lamports INTEGER NOT NULL DEFAULT 100000,
+    jito_tip_lamports INTEGER NOT NULL DEFAULT 10000,
+    mev_protection INTEGER NOT NULL DEFAULT 1,
+    buy_presets_usd TEXT NOT NULL DEFAULT '1,2,3,5',
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -777,6 +788,52 @@ def recover_stale_trade_orders(stale_seconds: int = 300) -> int:
         return cur.rowcount
     finally:
         conn.close()
+
+
+def get_wallet_profile(wallet_address: str) -> dict:
+    """Return persisted execution settings, creating defaults when absent."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM wallet_profiles WHERE wallet_address = ?", (wallet_address,)
+        ).fetchone()
+        if row:
+            return dict(row)
+        now = time.time()
+        conn.execute(
+            """INSERT INTO wallet_profiles
+               (wallet_address, name, slippage_bps, priority_fee_lamports,
+                jito_tip_lamports, mev_protection, buy_presets_usd, updated_at)
+               VALUES (?, 'Default', ?, 100000, 10000, 1, '1,2,3,5', ?)""",
+            (wallet_address, config.TRADE_SLIPPAGE_BPS, now),
+        )
+        conn.commit()
+        return dict(conn.execute(
+            "SELECT * FROM wallet_profiles WHERE wallet_address = ?", (wallet_address,)
+        ).fetchone())
+    finally:
+        conn.close()
+
+
+def update_wallet_profile(wallet_address: str, **settings: Any) -> dict:
+    """Update validated per-wallet execution settings."""
+    allowed = {"name", "slippage_bps", "priority_fee_lamports", "jito_tip_lamports",
+               "mev_protection", "buy_presets_usd"}
+    values = {key: value for key, value in settings.items() if key in allowed}
+    get_wallet_profile(wallet_address)
+    if values:
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        conn = _connect()
+        try:
+            conn.execute(
+                f"UPDATE wallet_profiles SET {assignments}, updated_at = ? WHERE wallet_address = ?",
+                (*values.values(), time.time(), wallet_address),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return get_wallet_profile(wallet_address)
 
 
 # -- Watchlist --
