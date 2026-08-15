@@ -21,6 +21,19 @@ import storage
 
 logger = logging.getLogger(__name__)
 
+MIN_BUY_USD = 0.50
+MAX_BUY_USD = 100.0
+
+
+def _is_valid_solana_address(value: str) -> bool:
+    """Return whether value is a canonical Solana public key."""
+    try:
+        from solders.pubkey import Pubkey  # type: ignore
+        Pubkey.from_string(value)
+        return True
+    except Exception:
+        return False
+
 
 def _is_authorized(update: Update) -> bool:
     """Allow trading controls only from configured user/chat."""
@@ -684,6 +697,11 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await _handle_menu_callback(update, context)
         return
 
+    if not _is_authorized(update):
+        logger.warning("[BOT] Unauthorized buy attempt blocked")
+        await query.answer("Not authorized", show_alert=True)
+        return
+
     await query.answer()
     logger.info("[BOT] Buy callback received: data=%s", query.data)
 
@@ -694,11 +712,20 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         except ValueError:
             return
         token_mint = parts[2]
+        if not MIN_BUY_USD <= usd_amount <= MAX_BUY_USD:
+            await _safe_edit_message(query, "Buy amount must be $0.50 - $100")
+            return
         amount_sol = executor.usd_to_sol(usd_amount)
+        if amount_sol <= 0:
+            await _safe_edit_message(query, "SOL price is unavailable. Please try again shortly.")
+            return
         display_amount = f"${usd_amount:.0f} ({amount_sol:.3f} SOL)"
     elif len(parts) == 2 and parts[0] == "buycustom":
         # Custom amount -- ask user to reply with amount
         token_mint = parts[1]
+        if not _is_valid_solana_address(token_mint):
+            await _safe_edit_message(query, "Invalid Solana token address.")
+            return
         context.user_data["pending_buy_token"] = token_mint
         base_text = query.message.text or "Trade"
         await _safe_edit_message(query, base_text + "\n\nType the amount in $ (e.g. 2.5):")
@@ -710,9 +737,8 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         return
 
-    if not _is_authorized(update):
-        logger.warning("[BOT] Unauthorized buy attempt: user=%s chat=%s", str(query.from_user.id) if query.from_user else "?", str(query.message.chat_id) if query.message else "?")
-        await query.answer("Not authorized", show_alert=True)
+    if not _is_valid_solana_address(token_mint):
+        await _safe_edit_message(query, "Invalid Solana token address.")
         return
 
     allowed, reason = executor.can_trade()
@@ -739,7 +765,7 @@ async def _handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         usd_spent = spent * sol_price
         position_recorded = bool(result.get("position_recorded", True))
         if position_recorded:
-            msg = base_text + f"\n\nBought ${usd_spent:.0f} ({spent:.3f} SOL) | impact: {impact:.1f}% | tx: {sig}...\nAdded to portfolio."
+            msg = base_text + f"\n\nBuy submitted: ${usd_spent:.0f} ({spent:.3f} SOL) | impact: {impact:.1f}% | tx: {sig}...\nAwaiting on-chain confirmation; added to portfolio."
         else:
             msg = base_text + f"\n\nTx submitted (${usd_spent:.0f}, {spent:.3f} SOL) | tx: {sig}...\nWarning: portfolio save failed. Check logs."
         await _safe_edit_message(query, msg)
@@ -759,6 +785,12 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not token_mint:
         return  # No pending action, ignore
 
+    if not _is_authorized(update):
+        context.user_data.pop("pending_buy_token", None)
+        logger.warning("[BOT] Unauthorized custom buy attempt blocked")
+        await update.message.reply_text("Not authorized")
+        return
+
     text = update.message.text.strip().replace("$", "").replace(",", "")
     try:
         usd_amount = float(text)
@@ -766,7 +798,7 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Invalid amount. Send a number (e.g. 2.5)")
         return
 
-    if usd_amount <= 0 or usd_amount > 100:
+    if not MIN_BUY_USD <= usd_amount <= MAX_BUY_USD:
         await update.message.reply_text("Amount must be $0.50 - $100")
         return
 
@@ -775,6 +807,9 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Execute buy
     amount_sol = executor.usd_to_sol(usd_amount)
+    if amount_sol <= 0:
+        await update.message.reply_text("SOL price is unavailable. Please try again shortly.")
+        return
     logger.info("[BOT] Custom buy requested: token=%s usd=%.2f", token_mint[:16], usd_amount)
     allowed, reason = executor.can_trade()
     if not allowed:
@@ -795,10 +830,10 @@ async def _handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         impact = result.get("price_impact_pct", 0)
         if result.get("position_recorded", True):
             await update.message.reply_text(
-                f"Bought ${usd_amount:.2f} ({amount_sol:.4f} SOL)\n"
+                f"Buy submitted: ${usd_amount:.2f} ({amount_sol:.4f} SOL)\n"
                 f"Impact: {impact:.1f}%\n"
                 f"Tx: {sig}...\n"
-                "Added to portfolio."
+                "Awaiting on-chain confirmation; added to portfolio."
             )
         else:
             await update.message.reply_text(
@@ -816,6 +851,10 @@ async def _handle_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Handle /buy <token> <$amount>."""
     if not update.message:
         return
+    if not _is_authorized(update):
+        logger.warning("[BOT] Unauthorized /buy attempt blocked")
+        await update.message.reply_text("Not authorized")
+        return
     args = context.args
     if not args or len(args) < 2:
         await update.message.reply_text("Usage: /buy <token_address> $5")
@@ -828,11 +867,18 @@ async def _handle_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Invalid amount")
         return
 
-    if usd <= 0 or usd > 100:
+    if not MIN_BUY_USD <= usd <= MAX_BUY_USD:
         await update.message.reply_text("Amount: $0.50 - $100")
         return
 
+    if not _is_valid_solana_address(token_mint):
+        await update.message.reply_text("Invalid Solana token address")
+        return
+
     amount_sol = executor.usd_to_sol(usd)
+    if amount_sol <= 0:
+        await update.message.reply_text("SOL price is unavailable. Please try again shortly.")
+        return
     allowed, reason = executor.can_trade()
     if not allowed:
         await update.message.reply_text(f"Blocked: {reason}")
@@ -848,7 +894,7 @@ async def _handle_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if result:
         if result.get("position_recorded", True):
-            await update.message.reply_text(f"Bought! tx: {result['signature'][:20]}... (added to portfolio)")
+            await update.message.reply_text(f"Buy submitted: {result['signature'][:20]}... (awaiting confirmation; added to portfolio)")
         else:
             await update.message.reply_text(f"Tx sent: {result['signature'][:20]}... but portfolio save failed")
     else:
