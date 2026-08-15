@@ -407,6 +407,48 @@ def _get_from_url(url: str, params: dict, headers: dict | None = None, timeout: 
         return None
 
 
+def _fetch_early_buyers_alchemy(token_address: str, limit: int) -> list[str] | None:
+    """Fetch early token recipients with Alchemy's transaction history API."""
+    if not config.ALCHEMY_RPC_URL:
+        return None
+    result = rpc_client.rpc_call(
+        "getTransactionsForAddress",
+        [token_address, {
+            "transactionDetails": "full",
+            "sortOrder": "asc",
+            "limit": min(100, max(limit * 2, 20)),
+            "commitment": "confirmed",
+            "encoding": "jsonParsed",
+            "filters": {"status": "succeeded", "tokenAccounts": "balanceChanged"},
+        }],
+        preferred_name="Alchemy",
+    )
+    if result is None:
+        return None
+    transactions = result.get("transactions", []) if isinstance(result, dict) else result
+    buyers: list[str] = []
+    seen: set[str] = set()
+    for item in transactions or []:
+        meta = item.get("meta") or ((item.get("transaction") or {}).get("meta")) or {}
+        pre_by_owner: dict[str, float] = {}
+        post_by_owner: dict[str, float] = {}
+        for balance in meta.get("preTokenBalances") or []:
+            if balance.get("mint") == token_address and balance.get("owner"):
+                owner = balance["owner"]
+                pre_by_owner[owner] = pre_by_owner.get(owner, 0) + _token_amount(balance)
+        for balance in meta.get("postTokenBalances") or []:
+            if balance.get("mint") == token_address and balance.get("owner"):
+                owner = balance["owner"]
+                post_by_owner[owner] = post_by_owner.get(owner, 0) + _token_amount(balance)
+        for owner in post_by_owner:
+            if post_by_owner[owner] > pre_by_owner.get(owner, 0) and owner not in seen:
+                seen.add(owner)
+                buyers.append(owner)
+                if len(buyers) >= limit:
+                    return buyers
+    return buyers
+
+
 def _fetch_early_buyers_birdeye(token_address: str, limit: int) -> list[str] | None:
     """Fetch early buyers via Birdeye public API. Returns None if rate-limited."""
     headers = {"x-chain": "solana"}
@@ -431,7 +473,7 @@ def _fetch_early_buyers_birdeye(token_address: str, limit: int) -> list[str] | N
             buyers.append(addr)
             if len(buyers) >= limit:
                 break
-    return buyers if buyers else None
+    return buyers
 
 
 def _fetch_early_buyers_solscan(token_address: str, limit: int) -> list[str] | None:
@@ -458,12 +500,13 @@ def _fetch_early_buyers_solscan(token_address: str, limit: int) -> list[str] | N
             buyers.append(addr)
             if len(buyers) >= limit:
                 break
-    return buyers if buyers else None
+    return buyers
 
 
 def _fetch_early_buyers(token_address: str, limit: int = 30) -> list[str]:
-    """Fetch earliest buyer wallets using Birdeye → Solscan fallbacks."""
+    """Fetch earliest buyers using Alchemy → Birdeye → Solscan fallbacks."""
     for provider_fn, name in [
+        (_fetch_early_buyers_alchemy, "Alchemy"),
         (_fetch_early_buyers_birdeye, "Birdeye"),
         (_fetch_early_buyers_solscan, "Solscan"),
     ]:
@@ -474,7 +517,8 @@ def _fetch_early_buyers(token_address: str, limit: int = 30) -> list[str]:
             return result
         logger.debug("[DISCOVERY] %s rate-limited for %s, trying next provider", name, token_address[:16])
 
-    logger.warning("[DISCOVERY] All providers failed for token %s", token_address[:16])
+    # Discovery is optional; provider outages must not create a warning storm.
+    logger.debug("[DISCOVERY] Providers unavailable for token %s", token_address[:16])
     return []
 
 
