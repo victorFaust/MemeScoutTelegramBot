@@ -1138,6 +1138,26 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
     if bracket_lines:
         lines += ["", "📊 BY SCORE"] + bracket_lines
 
+    # Provenance is essential for tuning: pool, scan and wallet alerts have
+    # very different selection criteria. Rows predating this field are kept in
+    # a separate legacy bucket instead of being guessed.
+    source_labels = {"scan": "Scan", "pool": "Pool", "wallet": "Wallet", "legacy": "Legacy"}
+    source_lines = []
+    for source in ("scan", "pool", "wallet", "legacy", "unknown"):
+        source_rows = [r for r in rows if (r.get("alert_source") or "legacy") == source]
+        if not source_rows:
+            continue
+        source_rugs = sum(1 for r in source_rows if r.get("rugged"))
+        valid = [r for r in source_rows if r.get("checked_1h") and r.get("price_1h") and r.get("price_at_alert")]
+        wins = sum(1 for r in valid if (_pct(r["price_1h"], r["price_at_alert"]) or 0) > 0)
+        win_text = f" | 1h win {wins/len(valid)*100:.0f}% ({len(valid)})" if valid else ""
+        label = source_labels.get(source, source.title())
+        source_lines.append(
+            f"  {label}: {len(source_rows)} | rugs {source_rugs/len(source_rows)*100:.0f}%{win_text}"
+        )
+    if source_lines:
+        lines += ["", "🔎 BY SOURCE"] + source_lines
+
     # ML training data + model status
     try:
         import feature_logger
@@ -1159,8 +1179,8 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
             f"  🌙 moon: {ml['moons']} | 🚀 pump: {ml['pumps']} | ⚪ neutral: {ml['neutrals']} | 📉 dump: {ml['dumps']} | 🚩 rug: {ml['rugs']}",
             model_line,
         ]
-        if ml['rugs'] and usable == 0:
-            lines.append("  ⚠️ Historical rug-only labels are excluded from training")
+        if ml['rugs']:
+            lines.append(f"  ⚠️ {ml['rugs']} rug labels quarantined from training")
     except Exception:
         pass
 
