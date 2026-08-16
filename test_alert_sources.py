@@ -61,6 +61,19 @@ class AlertSourceTests(unittest.TestCase):
         conn.close()
         self.assertEqual(row, ("pool", 72.0, 91.0, 19.0))
 
+    def test_new_rug_confirmation_is_versioned_as_verified(self):
+        feature_logger.log_features(
+            "rug-token", "solana", "RUG", {"score": 10, "breakdown": {}},
+            {"priceUsd": "1"}, alert_source="scan",
+        )
+        feature_logger.mark_rugged("rug-token", "solana")
+        conn = sqlite3.connect(storage.DB_PATH)
+        row = conn.execute(
+            "SELECT rugged, rug_verified, outcome_label FROM ml_features WHERE token_address = 'rug-token'"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row, (1, 1, "rug"))
+
 
 if __name__ == "__main__":
     unittest.main()

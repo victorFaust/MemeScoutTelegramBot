@@ -20,7 +20,7 @@ def _outcomes() -> list[dict]:
 
 
 def _return_1h(row: dict) -> float | None:
-    if row.get("rugged"):
+    if row.get("rugged") and row.get("rug_verified"):
         return -100.0
     entry = float(row.get("price_at_alert") or row.get("price_usd") or 0)
     price = float(row.get("price_1h") or 0)

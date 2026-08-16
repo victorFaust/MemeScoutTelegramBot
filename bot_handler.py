@@ -70,7 +70,8 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚙️ Profiles", callback_data="menu:profiles")],
         [InlineKeyboardButton("👁 Watchlist", callback_data="menu:watchlist"),
          InlineKeyboardButton("📜 History", callback_data="menu:trades")],
-        [InlineKeyboardButton("⏱ Execution", callback_data="menu:execution")],
+        [InlineKeyboardButton("⏱ Execution", callback_data="menu:execution"),
+         InlineKeyboardButton("🧠 Model", callback_data="menu:model")],
         [InlineKeyboardButton("🤖 Auto-Buy: " + ("ON" if config.AUTO_BUY_ENABLED else "OFF"), callback_data="menu:autobuy"),
          InlineKeyboardButton("🚨 Stop", callback_data="menu:stop")],
     ])
@@ -141,6 +142,8 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await _show_profiles(query)
     elif action == "execution":
         await _show_execution(query)
+    elif action == "model":
+        await _show_model(query)
     elif action == "trades":
         await _show_trades(query)
     elif action.startswith("trade_"):
@@ -319,6 +322,50 @@ async def _handle_execution_command(update: Update, context: ContextTypes.DEFAUL
     except ValueError:
         days = 7
     await update.message.reply_text(_execution_report(days))
+
+
+def _model_report() -> str:
+    import ml_model
+    info = ml_model.get_model_info()
+    lines = ["🧠 PREDICTION MODEL · SHADOW MODE", "━━━━━━━━━━━━━━━━━━"]
+    if info["status"] != "active":
+        lines += [
+            f"Status: collecting chronological data ({info.get('labeled_samples', 0)}/{info.get('needed', 200)})",
+            "Target: P(return ≥ +10% at 1h)",
+            "No model output can authorize an auto-buy.",
+        ]
+        return "\n".join(lines)
+
+    lines += [f"Target: {info.get('target')}", "Split: oldest 60% train · next 20% calibrate · newest 20% test"]
+    for name, metrics in (info.get("metrics") or {}).items():
+        expectancy = metrics.get("expectancy_pct")
+        drawdown = metrics.get("max_drawdown_pct")
+        lines += [
+            "",
+            f"{name.upper()} · n={metrics.get('samples')} · test={metrics.get('test_samples')}",
+            f"Precision {metrics.get('precision_pct', 0):.1f}% · Recall {metrics.get('recall_pct', 0):.1f}% · Brier {metrics.get('brier', 0):.4f}",
+            f"Predicted trades {metrics.get('predicted_trades', 0)} · net expectancy "
+            f"{f'{expectancy:+.1f}%' if expectancy is not None else 'N/A'} · max DD "
+            f"{f'{drawdown:.1f}%' if drawdown is not None else 'N/A'}",
+        ]
+    lines += ["", "Advisory only: empirical calibration and safety gates control auto-buy."]
+    return "\n".join(lines)
+
+
+async def _show_model(query) -> None:
+    await query.edit_message_text(_model_report(), reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Refresh", callback_data="menu:model"),
+        InlineKeyboardButton("⬅️ Dashboard", callback_data="menu:back"),
+    ]]))
+
+
+async def _handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
+    await update.message.reply_text(_model_report())
 
 
 async def _send_positions(target, text: str, reply_markup) -> None:
@@ -1602,10 +1649,14 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
         model_info = ml_model.get_model_info()
 
         if model_info["status"] == "active":
-            model_line = f"  Model: ACTIVE ✅ (accuracy {model_info['accuracy']}%)"
+            metrics = (model_info.get("metrics") or {}).get("all", {})
+            model_line = (
+                f"  Model: SHADOW 🧪 | test n={metrics.get('test_samples', 0)} | "
+                f"precision {metrics.get('precision_pct', 0):.0f}% | Brier {metrics.get('brier', 0):.3f}"
+            )
         else:
             pct = min(100, model_info.get("progress_pct", 0))
-            model_line = f"  Model: training data {pct}% ({usable}/{200} usable samples)"
+            model_line = f"  Model: shadow training data {pct}% ({model_info.get('labeled_samples', usable)}/200 valid 1h samples)"
 
         lines += [
             "",
@@ -1614,7 +1665,7 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
             model_line,
         ]
         if ml['rugs']:
-            lines.append(f"  ⚠️ {ml['rugs']} rug labels quarantined from training")
+            lines.append("  🚩 Newly verified rugs are negatives; legacy rug-only labels remain quarantined")
     except Exception:
         pass
 
@@ -1880,6 +1931,7 @@ async def start_bot_handler() -> None:
         BotCommand("cancelorder", "Cancel order: /cancelorder <id>"),
         BotCommand("profile", "Configure wallet execution profile"),
         BotCommand("execution", "Execution quality: /execution [days]"),
+        BotCommand("model", "Shadow prediction model metrics"),
         BotCommand("watch", "Watch token: /watch <address>"),
         BotCommand("wallets", "View tracked wallets"),
         BotCommand("addwallet", "Track wallet: /addwallet <addr> [label] [wr%]"),
@@ -1902,6 +1954,7 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("cancelorder", _handle_cancelorder_command))
     app.add_handler(CommandHandler("profile", _handle_profile_command))
     app.add_handler(CommandHandler("execution", _handle_execution_command))
+    app.add_handler(CommandHandler("model", _handle_model_command))
     app.add_handler(CommandHandler("watch", _handle_watch_command))
     app.add_handler(CommandHandler("addwallet", _handle_addwallet_command))
     app.add_handler(CommandHandler("wallets", _handle_wallets_command))
