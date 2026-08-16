@@ -70,6 +70,7 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚙️ Profiles", callback_data="menu:profiles")],
         [InlineKeyboardButton("👁 Watchlist", callback_data="menu:watchlist"),
          InlineKeyboardButton("📜 History", callback_data="menu:trades")],
+        [InlineKeyboardButton("⏱ Execution", callback_data="menu:execution")],
         [InlineKeyboardButton("🤖 Auto-Buy: " + ("ON" if config.AUTO_BUY_ENABLED else "OFF"), callback_data="menu:autobuy"),
          InlineKeyboardButton("🚨 Stop", callback_data="menu:stop")],
     ])
@@ -138,6 +139,8 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await _show_orders(query)
     elif action == "profiles":
         await _show_profiles(query)
+    elif action == "execution":
+        await _show_execution(query)
     elif action == "trades":
         await _show_trades(query)
     elif action.startswith("trade_"):
@@ -233,6 +236,89 @@ async def _show_profiles(query) -> None:
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[
         InlineKeyboardButton("⬅️ Dashboard", callback_data="menu:back")
     ]]))
+
+
+def _execution_report(days: int = 7) -> str:
+    attempts = storage.get_execution_attempts_since(time.time() - days * 86400)
+    if not attempts:
+        return f"⏱ EXECUTION QUALITY · {days}D\n━━━━━━━━━━━━━━━━━━\nNo execution attempts recorded yet."
+
+    submitted = [row for row in attempts if row.get("signature")]
+    confirmed = [row for row in attempts if row.get("status") in {"confirmed", "finalized"}]
+    failed = [row for row in attempts if row.get("status") in {"failed", "dropped", "blocked"}]
+
+    def average(field: str, rows=attempts):
+        values = [float(row[field]) for row in rows if row.get(field) is not None]
+        return sum(values) / len(values) if values else None
+
+    def ms(value):
+        return f"{value:.0f}ms" if value is not None else "N/A"
+
+    def summed_average(fields: tuple[str, ...], rows):
+        totals = [sum(float(row.get(field) or 0) for field in fields) for row in rows
+                  if all(row.get(field) is not None for field in fields)]
+        return sum(totals) / len(totals) if totals else None
+
+    slippage = []
+    for row in confirmed:
+        expected = int(row.get("expected_out") or 0)
+        realized = row.get("realized_out")
+        if expected > 0 and realized is not None:
+            slippage.append((int(realized) - expected) / expected * 100)
+
+    lines = [
+        f"⏱ EXECUTION QUALITY · {days}D", "━━━━━━━━━━━━━━━━━━",
+        f"Attempts: {len(attempts)} · Submitted: {len(submitted)} · Confirmed: {len(confirmed)}",
+        f"Terminal failures/blocks: {len(failed)}",
+        "", "LATENCY",
+        f"Quote {ms(average('quote_ms'))} · Build {ms(average('build_ms'))}",
+        f"Sign {ms(average('sign_ms'))} · Submit {ms(average('submit_ms'))}",
+        f"Confirm {ms(average('confirmation_ms', confirmed))}",
+        f"Submit pipeline {ms(summed_average(('quote_ms', 'build_ms', 'sign_ms', 'submit_ms'), submitted))}",
+        f"End-to-end confirmed {ms(summed_average(('quote_ms', 'build_ms', 'sign_ms', 'submit_ms', 'confirmation_ms'), confirmed))}",
+    ]
+    if slippage:
+        lines.append(f"Realized vs quote: {sum(slippage)/len(slippage):+.2f}% avg ({len(slippage)} measured)")
+
+    providers: dict[str, list[dict]] = {}
+    for row in submitted:
+        providers.setdefault(row.get("submit_provider") or "unknown", []).append(row)
+    if providers:
+        lines += ["", "BY SUBMISSION PATH"]
+        for provider, rows in sorted(providers.items()):
+            successes = sum(1 for row in rows if row.get("status") in {"confirmed", "finalized"})
+            lines.append(f"{provider.upper()}: {successes}/{len(rows)} confirmed · submit {ms(average('submit_ms', rows))}")
+
+    stages: dict[str, int] = {}
+    for row in failed:
+        stage = row.get("failure_stage") or "unknown"
+        stages[stage] = stages.get(stage, 0) + 1
+    if stages:
+        lines += ["", "FAILURE STAGES", " · ".join(f"{key}: {value}" for key, value in sorted(stages.items()))]
+    return "\n".join(lines)
+
+
+async def _show_execution(query) -> None:
+    await query.edit_message_text(
+        _execution_report(7),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Refresh", callback_data="menu:execution"),
+            InlineKeyboardButton("⬅️ Dashboard", callback_data="menu:back"),
+        ]]),
+    )
+
+
+async def _handle_execution_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
+    try:
+        days = max(1, min(30, int(context.args[0]))) if context.args else 7
+    except ValueError:
+        days = 7
+    await update.message.reply_text(_execution_report(days))
 
 
 async def _send_positions(target, text: str, reply_markup) -> None:
@@ -1776,6 +1862,7 @@ async def start_bot_handler() -> None:
         BotCommand("orders", "View persistent orders"),
         BotCommand("cancelorder", "Cancel order: /cancelorder <id>"),
         BotCommand("profile", "Configure wallet execution profile"),
+        BotCommand("execution", "Execution quality: /execution [days]"),
         BotCommand("watch", "Watch token: /watch <address>"),
         BotCommand("wallets", "View tracked wallets"),
         BotCommand("addwallet", "Track wallet: /addwallet <addr> [label] [wr%]"),
@@ -1797,6 +1884,7 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("orders", _handle_orders_command))
     app.add_handler(CommandHandler("cancelorder", _handle_cancelorder_command))
     app.add_handler(CommandHandler("profile", _handle_profile_command))
+    app.add_handler(CommandHandler("execution", _handle_execution_command))
     app.add_handler(CommandHandler("watch", _handle_watch_command))
     app.add_handler(CommandHandler("addwallet", _handle_addwallet_command))
     app.add_handler(CommandHandler("wallets", _handle_wallets_command))

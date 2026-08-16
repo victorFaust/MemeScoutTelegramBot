@@ -988,6 +988,7 @@ async def _tx_confirmation_loop() -> None:
     while True:
         await asyncio.sleep(10)
         try:
+            await _reconcile_execution_attempts()
             pending = storage.get_positions_needing_confirmation()
             if not pending:
                 await _reconcile_open_positions()
@@ -1067,6 +1068,46 @@ async def _tx_confirmation_loop() -> None:
 
         except Exception:
             logger.exception("[TX] Error in confirmation loop")
+
+
+async def _reconcile_execution_attempts() -> None:
+    """Advance submitted buy and sell telemetry to a terminal on-chain state."""
+    import executor
+
+    now = time.time()
+    for attempt in storage.get_pending_execution_attempts():
+        signature = attempt.get("signature", "")
+        submitted_at = attempt.get("submitted_at") or attempt.get("started_at") or now
+        age = now - submitted_at
+        status = await asyncio.to_thread(executor.confirm_transaction, signature)
+        if status in {"confirmed", "finalized"}:
+            if attempt["side"] == "buy":
+                realized = await asyncio.to_thread(
+                    executor.get_confirmed_token_delta, signature,
+                    attempt.get("wallet_address", ""), attempt["token_address"],
+                )
+            else:
+                realized = await asyncio.to_thread(
+                    executor.get_confirmed_sol_delta, signature, attempt.get("wallet_address", "")
+                )
+            storage.update_execution_attempt(
+                attempt["id"], status=status, confirmed_at=now,
+                confirmation_ms=max(0, (now - submitted_at) * 1000), realized_out=realized,
+            )
+        elif status == "failed":
+            storage.update_execution_attempt(
+                attempt["id"], status="failed", confirmed_at=now,
+                confirmation_ms=max(0, (now - submitted_at) * 1000),
+                failure_stage="confirmation", error="transaction failed on-chain",
+            )
+        elif status == "not_found" and age > 600:
+            storage.update_execution_attempt(
+                attempt["id"], status="dropped", confirmed_at=now,
+                confirmation_ms=max(0, age * 1000), failure_stage="confirmation",
+                error="signature not found after 10 minutes",
+            )
+        elif status == "not_found" and age > 90 and attempt["status"] == "submitted":
+            storage.update_execution_attempt(attempt["id"], status="unconfirmed")
 
 
 _last_position_reconciliation = 0.0
