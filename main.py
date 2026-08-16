@@ -21,6 +21,7 @@ import performance_tracker
 import pool_listener
 import bot_handler
 import rugcheck
+import score_calibration
 import safety_check
 import startup_check
 import storage
@@ -246,6 +247,9 @@ async def _run_chain_cycle(chain_id: str) -> None:
             logger.info("[ML] $%s pump probability: %.0f%%", base.get("symbol", "?"), ml_prob * 100)
             result["ml_prob"] = ml_prob
 
+        calibration = score_calibration.calibrate("scan", result["score"], chain)
+        result["calibration"] = calibration
+
         ok = await tg.send_alert(result, safety=safety_data)
         if ok:
             storage.record_alert(chain, addr, result["score"])
@@ -259,6 +263,7 @@ async def _run_chain_cycle(chain_id: str) -> None:
                 liquidity=(pair.get("liquidity") or {}).get("usd"),
                 market_cap=pair.get("marketCap") or pair.get("fdv"),
                 alert_source="scan",
+                calibration=calibration,
             )
             # Log ML features for learning system
             feature_logger.log_features(
@@ -358,27 +363,32 @@ async def _handle_new_pool(token_info: dict) -> None:
     elif holder_data:
         rc_data = holder_data
 
+    pool_score_result = filters.score_pair(pair, cfg)
+    pool_calibration = score_calibration.calibrate("pool", pool_score_result["score"], chain_id)
+    token_info["score_result"] = pool_score_result
+    token_info["calibration"] = pool_calibration
+
     # Send alert
     ok = await tg.send_new_pool_alert(token_info, rc_data)
     if ok:
         _pool_alert_times.append(time.time())
-        storage.record_alert(chain_id, token_address, 0)
+        storage.record_alert(chain_id, token_address, pool_score_result["score"])
         storage.record_outcome(
             token_address=token_address,
             chain_id=chain_id,
             pair_address=pair.get("pairAddress", ""),
             token_symbol=token_info.get("symbol", "?"),
-            score=0,
+            score=pool_score_result["score"],
             price=_safe_float(pair.get("priceUsd")),
             liquidity=(pair.get("liquidity") or {}).get("usd"),
             market_cap=pair.get("marketCap") or pair.get("fdv"),
             alert_source="pool",
+            calibration=pool_calibration,
         )
         logger.info("[POOL] Alert sent: $%s (%s) | %d txns",
                     token_info["symbol"], token_address[:16], total_txns)
 
         # Log ML features for new pool alerts
-        pool_score_result = {"score": 0, "breakdown": {}}
         feature_logger.log_features(
             token_address=token_address,
             chain_id=chain_id,
@@ -423,6 +433,8 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
     mc = pair.get("marketCap") or pair.get("fdv") or 0
     liq = (pair.get("liquidity") or {}).get("usd", 0) or 0
     price = float(pair.get("priceUsd", 0) or 0)
+    wallet_score_result = filters.score_pair(pair, config.get_chain_profile(chain_id))
+    wallet_calibration = score_calibration.calibrate("wallet", wallet_score_result["score"], chain_id)
 
     logger.info("[WALLET] $%s: MC=$%.0fK, Liq=$%.0fK, Price=$%.8f", symbol, mc/1000, liq/1000, price)
 
@@ -494,6 +506,11 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
         f"👛 Wallet: {wallet_label}\n"
         f"Win Rate: {wallet_wr:.0f}%\n"
         f"Confidence: {confidence} wallet(s) {conf_emoji}\n"
+        f"Entry Score: {wallet_score_result['score']:.0f}/100"
+        + (f" (setup {wallet_score_result['setup_score']:.0f}, penalty -{wallet_score_result['entry_risk_penalty']:.0f})\n"
+           if wallet_score_result.get("entry_risk_penalty") else "\n")
+        + f"Historical 1h win: {wallet_calibration['probability']*100:.0f}% | "
+          f"expectancy {wallet_calibration['expectancy_pct']:+.1f}% (n={wallet_calibration['samples']})\n"
     )
 
     if safety_data:
@@ -507,16 +524,26 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
     # Send alert via Telegram
     ok = await tg.send_trade_notification(alert_text, token_address)
     if ok:
-        storage.record_alert(chain_id, token_address, 0)
+        storage.record_alert(chain_id, token_address, wallet_score_result["score"])
         storage.record_outcome(
             token_address=token_address,
             chain_id=chain_id,
             pair_address=pair.get("pairAddress", ""),
             token_symbol=symbol,
-            score=0,
+            score=wallet_score_result["score"],
             price=price,
             liquidity=liq,
             market_cap=mc,
+            alert_source="wallet",
+            calibration=wallet_calibration,
+        )
+        feature_logger.log_features(
+            token_address=token_address,
+            chain_id=chain_id,
+            token_symbol=symbol,
+            score_result=wallet_score_result,
+            pair=pair,
+            safety_data=safety_data,
             alert_source="wallet",
         )
 
@@ -542,10 +569,12 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
         config.AUTO_BUY_ENABLED
         and config.TRADING_ENABLED
         and (confidence >= 2 or wallet_wr >= 60)  # 2+ wallets OR single wallet with 60%+ WR
+        and wallet_calibration["eligible"]
+        and holder_pass
     )
-    # Holder check is advisory for copy-trades (log but don't block)
+    # Holder concentration is a hard auto-buy gate; alerts remain visible for review.
     if not holder_pass:
-        logger.info("[WALLET] $%s holder analysis failed -- proceeding anyway (copy-trade)", symbol)
+        logger.info("[WALLET] $%s holder analysis failed -- auto-buy blocked", symbol)
 
     if not should_buy:
         reasons = []
@@ -555,6 +584,13 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
             reasons.append("TRADING_ENABLED=false")
         if not (confidence >= 2 or wallet_wr >= 50):
             reasons.append(f"low confidence ({confidence}) and WR ({wallet_wr:.0f}%)")
+        if not wallet_calibration["eligible"]:
+            reasons.append(
+                f"calibration blocked ({wallet_calibration['probability']*100:.0f}% win, "
+                f"{wallet_calibration['expectancy_pct']:+.1f}% expectancy, n={wallet_calibration['samples']})"
+            )
+        if not holder_pass:
+            reasons.append("holder analysis failed")
         logger.info("[WALLET] $%s auto-buy skipped: %s", symbol, ", ".join(reasons))
         return
 

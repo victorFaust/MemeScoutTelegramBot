@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS ml_features (
 
     -- Scoring breakdown (0-1 each)
     score_total         REAL,
+    score_setup         REAL,
+    entry_risk_penalty  REAL,
     score_liquidity     REAL,
     score_market_cap    REAL,
     score_pair_age      REAL,
@@ -100,6 +102,10 @@ def _connect() -> sqlite3.Connection:
             "ALTER TABLE ml_features ADD COLUMN alert_source TEXT NOT NULL DEFAULT 'legacy'"
         )
         conn.commit()
+    for name in ("score_setup", "entry_risk_penalty"):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE ml_features ADD COLUMN {name} REAL")
+            conn.commit()
     return conn
 
 
@@ -160,7 +166,8 @@ def log_features(
         conn.execute(
             """INSERT OR REPLACE INTO ml_features (
                 token_address, chain_id, token_symbol, alert_source, alerted_at,
-                score_total, score_liquidity, score_market_cap, score_pair_age,
+                score_total, score_setup, entry_risk_penalty,
+                score_liquidity, score_market_cap, score_pair_age,
                 score_vol_liq, score_price_change, score_buy_sell, score_velocity,
                 liquidity_usd, market_cap, volume_24h, volume_6h, volume_1h,
                 price_usd, price_change_5m, price_change_1h, price_change_6h, price_change_24h,
@@ -168,10 +175,12 @@ def log_features(
                 pair_age_hours, vol_liq_ratio, buy_sell_ratio_1h,
                 rugcheck_score, lp_locked_pct, top_holder_pct, unique_buyers, risk_count, is_mint_authority,
                 hour_utc, day_of_week, is_us_hours
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 token_address, chain_id, token_symbol, alert_source, now,
                 score_result.get("score", 0),
+                score_result.get("setup_score", score_result.get("score", 0)),
+                score_result.get("entry_risk_penalty", 0),
                 breakdown.get("liquidity", 0),
                 breakdown.get("market_cap", 0),
                 breakdown.get("pair_age", 0),

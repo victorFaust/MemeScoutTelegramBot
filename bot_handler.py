@@ -1575,6 +1575,23 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
     if source_lines:
         lines += ["", "🔎 BY SOURCE"] + source_lines
 
+    try:
+        import score_calibration
+        calibration_lines = []
+        for source, score, label in (
+            ("scan", 55, "Scan 50-59"), ("scan", 65, "Scan 60-69"),
+            ("scan", 75, "Scan 70-79"), ("scan", 85, "Scan 80-89"),
+            ("scan", 95, "Scan 90-99"), ("pool", 0, "Pool"), ("wallet", 0, "Wallet"),
+        ):
+            cal = score_calibration.calibrate(source, score, "solana")
+            state = "✅ trade" if cal["eligible"] else "⛔ no auto-buy"
+            calibration_lines.append(
+                f"  {label}: {cal['probability']*100:.0f}% win | exp {cal['expectancy_pct']:+.1f}% | n={cal['samples']} | {state}"
+            )
+        lines += ["", "🎯 CALIBRATION (+10% AT 1H)"] + calibration_lines
+    except Exception:
+        logger.exception("[BOT] Calibration report failed")
+
     # ML training data + model status
     try:
         import feature_logger

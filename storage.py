@@ -52,7 +52,10 @@ CREATE TABLE IF NOT EXISTS alert_outcomes (
     checked_6h          INTEGER DEFAULT 0,
     checked_24h         INTEGER DEFAULT 0,
     rugged              INTEGER DEFAULT 0,
-    alert_source        TEXT NOT NULL DEFAULT 'legacy'
+    alert_source        TEXT NOT NULL DEFAULT 'legacy',
+    calibrated_probability REAL,
+    calibrated_expectancy REAL,
+    calibration_samples INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS token_metrics (
@@ -179,6 +182,14 @@ def _connect() -> sqlite3.Connection:
             "ALTER TABLE alert_outcomes ADD COLUMN alert_source TEXT NOT NULL DEFAULT 'legacy'"
         )
         conn.commit()
+    for name, definition in (
+        ("calibrated_probability", "REAL"),
+        ("calibrated_expectancy", "REAL"),
+        ("calibration_samples", "INTEGER"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE alert_outcomes ADD COLUMN {name} {definition}")
+            conn.commit()
     position_columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
     if "wallet_address" not in position_columns:
         conn.execute("ALTER TABLE positions ADD COLUMN wallet_address TEXT")
@@ -288,6 +299,7 @@ def record_outcome(
     liquidity: float | None,
     market_cap: float | None,
     alert_source: str = "unknown",
+    calibration: dict | None = None,
 ) -> None:
     """Record an alert outcome row when an alert is sent."""
     conn = _connect()
@@ -296,10 +308,14 @@ def record_outcome(
             """INSERT INTO alert_outcomes
                (token_address, chain_id, pair_address, token_symbol, alerted_at,
                 score_at_alert, price_at_alert, liquidity_at_alert, market_cap_at_alert,
-                alert_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                alert_source, calibrated_probability, calibrated_expectancy,
+                calibration_samples)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (token_address, chain_id, pair_address, token_symbol, time.time(),
-             score, price, liquidity, market_cap, alert_source),
+             score, price, liquidity, market_cap, alert_source,
+             (calibration or {}).get("probability"),
+             (calibration or {}).get("expectancy_pct"),
+             (calibration or {}).get("samples")),
         )
         conn.commit()
     finally:

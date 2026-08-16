@@ -174,7 +174,26 @@ def build_message(result: dict, safety: dict | None = None) -> str:
                 lines.append(f"Creator: {creates} tokens deployed")
 
     lines.append("")
-    lines.append(f"\u2b50 Score: *{score}/100*")
+    setup_score = result.get("setup_score", score)
+    penalty = result.get("entry_risk_penalty", 0) or 0
+    if penalty > 0:
+        lines.append(f"\u2b50 Entry score: *{score}/100* (setup {setup_score:.0f}, penalty -{penalty:.0f})")
+        reasons = result.get("penalty_reasons") or []
+        if reasons:
+            lines.append(f"Late-entry risks: {', '.join(reasons[:2])}")
+    else:
+        lines.append(f"\u2b50 Entry score: *{score}/100*")
+
+    calibration = result.get("calibration") or {}
+    if calibration:
+        probability = calibration.get("probability", 0) * 100
+        expectancy = calibration.get("expectancy_pct", 0)
+        samples = calibration.get("samples", 0)
+        evidence = "trade-qualified" if calibration.get("eligible") else "insufficient/negative evidence"
+        lines.append(
+            f"\U0001f3af Historical 1h win: *{probability:.0f}%* | expectancy {expectancy:+.1f}% "
+            f"(n={samples}, {evidence})"
+        )
 
     if dex_url:
         lines.append(f"[View on DexScreener]({dex_url})")
@@ -279,6 +298,19 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
         lp_locked = rc_data.get("lp_locked_pct", 0)
         if rc_score is not None:
             lines.append(f"\U0001f6e1 RugCheck: {rc_score:.0%} safe | LP: {lp_locked:.0f}%")
+
+    score_result = token_info.get("score_result") or {}
+    calibration = token_info.get("calibration") or {}
+    if score_result:
+        score = score_result.get("score", 0)
+        setup = score_result.get("setup_score", score)
+        penalty = score_result.get("entry_risk_penalty", 0)
+        lines.append(f"\u2b50 Entry score: *{score:.0f}/100* (setup {setup:.0f}, penalty -{penalty:.0f})")
+    if calibration:
+        lines.append(
+            f"\U0001f3af Historical 1h win: *{calibration['probability']*100:.0f}%* | "
+            f"expectancy {calibration['expectancy_pct']:+.1f}% (n={calibration['samples']})"
+        )
 
     lines.append("")
     lines.append(f"[View on DexScreener]({dex_url})")

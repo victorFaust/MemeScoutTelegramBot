@@ -172,6 +172,45 @@ _SCORE_FNS: dict[str, Any] = {
 }
 
 
+def _entry_risk_penalty(pair: dict) -> tuple[float, list[str]]:
+    """Penalize late entries and activity patterns easily inflated by manipulation."""
+    pc = pair.get("priceChange") or {}
+    m5 = float(pc.get("m5", 0) or 0)
+    h1 = float(pc.get("h1", 0) or 0)
+    h6 = float(pc.get("h6", 0) or 0)
+    volume = float(_safe(pair, "volume", "h24", default=0) or 0)
+    liquidity = float(_safe(pair, "liquidity", "usd", default=0) or 0)
+    txns = _safe(pair, "txns", "h1", default={}) or {}
+    buys = int(txns.get("buys", 0) or 0)
+    sells = int(txns.get("sells", 0) or 0)
+    total = buys + sells
+
+    penalty = 0.0
+    reasons: list[str] = []
+    if m5 > 25:
+        value = min(18.0, 8.0 + (m5 - 25) * 0.25)
+        penalty += value
+        reasons.append(f"5m overextended +{m5:.0f}%")
+    if h1 > 100:
+        value = min(22.0, 10.0 + (h1 - 100) * 0.08)
+        penalty += value
+        reasons.append(f"1h overextended +{h1:.0f}%")
+    if h6 > 300:
+        penalty += min(12.0, 6.0 + (h6 - 300) * 0.02)
+        reasons.append(f"6h overextended +{h6:.0f}%")
+    vol_liq = volume / liquidity if liquidity > 0 else 0
+    if vol_liq > 12:
+        penalty += min(15.0, 5.0 + (vol_liq - 12) * 0.5)
+        reasons.append(f"extreme volume/liquidity {vol_liq:.1f}x")
+    if total >= 50 and buys / total > 0.9:
+        penalty += 10.0
+        reasons.append(f"one-sided transactions {buys}/{sells}")
+    if h1 > 50 and m5 < -5:
+        penalty += 10.0
+        reasons.append("momentum already reversing")
+    return min(40.0, penalty), reasons
+
+
 def score_pair(pair: dict, cfg: dict | None = None) -> dict:
     """Score a single pair using the given chain profile.
     Returns {"score": float, "breakdown": dict, "pair": dict}."""
@@ -195,8 +234,14 @@ def score_pair(pair: dict, cfg: dict | None = None) -> dict:
     if boost > 1.0:
         breakdown["time_boost"] = round(boost, 2)
 
-    total = round(min(total, 100.0), 1)
-    return {"score": total, "breakdown": breakdown, "pair": pair}
+    setup_score = round(min(total, 100.0), 1)
+    penalty, reasons = _entry_risk_penalty(pair)
+    total = round(max(0.0, setup_score - penalty), 1)
+    breakdown["entry_risk_penalty"] = round(penalty, 1)
+    return {
+        "score": total, "setup_score": setup_score, "entry_risk_penalty": round(penalty, 1),
+        "penalty_reasons": reasons, "breakdown": breakdown, "pair": pair,
+    }
 
 
 # -- Hard-reject gate --
