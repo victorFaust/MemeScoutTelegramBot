@@ -88,6 +88,9 @@ DCA_SELL_EACH: float = _float("DCA_SELL_EACH", 33.0)     # % of position to sell
 AUTO_BUY_ENABLED: bool = os.getenv("AUTO_BUY_ENABLED", "false").lower() in ("1", "true", "yes")
 AUTO_BUY_AMOUNT_USD: float = _float("AUTO_BUY_AMOUNT_USD", 3.0)
 AUTO_BUY_NEW_POOLS: bool = os.getenv("AUTO_BUY_NEW_POOLS", "false").lower() in ("1", "true", "yes")
+AUTO_BUY_MIN_CALIBRATION_SAMPLES: int = _int("AUTO_BUY_MIN_CALIBRATION_SAMPLES", 20)
+AUTO_BUY_MIN_CALIBRATED_PROB: float = _float("AUTO_BUY_MIN_CALIBRATED_PROB", 0.45)
+AUTO_BUY_MIN_EXPECTANCY_PCT: float = _float("AUTO_BUY_MIN_EXPECTANCY_PCT", 5.0)
 
 LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")
 LOG_MAX_BYTES: int = _int("LOG_MAX_BYTES", 5_242_880)

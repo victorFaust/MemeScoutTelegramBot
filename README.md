@@ -119,6 +119,10 @@ Each pair is scored 0-100 using per-chain weighted criteria:
 
 Pairs below `min_alert_score` (per chain, default 50) are not alerted.
 
+The displayed entry score is the weighted setup score minus late-entry risk penalties for overextended 5m/1h/6h movement, extreme volume relative to liquidity, one-sided transaction flow, and momentum reversal. It is not presented as a probability. Alerts separately show a source- and chain-specific historical probability of gaining at least 10% after one hour, its average expectancy, and cohort sample size.
+
+Autonomous copy-buys fail closed unless their historical wallet-alert cohort has at least `AUTO_BUY_MIN_CALIBRATION_SAMPLES`, meets `AUTO_BUY_MIN_CALIBRATED_PROB`, and has expectancy above `AUTO_BUY_MIN_EXPECTANCY_PCT`. Manual buy buttons remain available for review even when auto-buy is blocked.
+
 ## Safety Check (GoPlus API)
 
 After scoring, each token is checked against the GoPlus Security API:

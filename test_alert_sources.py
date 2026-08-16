@@ -27,6 +27,17 @@ class AlertSourceTests(unittest.TestCase):
         rows = storage.get_outcomes_for_report(1)
         self.assertEqual(rows[0]["alert_source"], "pool")
 
+    def test_outcome_calibration_evidence_is_persisted(self):
+        storage.record_outcome(
+            "token", "solana", "pair", "TOK", 72, 1.0, 1000, 2000,
+            alert_source="scan",
+            calibration={"probability": 0.31, "expectancy_pct": -8.2, "samples": 40},
+        )
+        row = storage.get_outcomes_for_report(1)[0]
+        self.assertEqual(row["calibrated_probability"], 0.31)
+        self.assertEqual(row["calibrated_expectancy"], -8.2)
+        self.assertEqual(row["calibration_samples"], 40)
+
     def test_existing_outcomes_migrate_to_legacy(self):
         conn = sqlite3.connect(storage.DB_PATH)
         conn.execute("CREATE TABLE alert_outcomes (id INTEGER PRIMARY KEY)")
@@ -39,13 +50,16 @@ class AlertSourceTests(unittest.TestCase):
 
     def test_feature_source_is_persisted(self):
         feature_logger.log_features(
-            "token", "solana", "TOK", {"score": 0, "breakdown": {}},
+            "token", "solana", "TOK",
+            {"score": 72, "setup_score": 91, "entry_risk_penalty": 19, "breakdown": {}},
             {"priceUsd": "1"}, alert_source="pool",
         )
         conn = sqlite3.connect(storage.DB_PATH)
-        source = conn.execute("SELECT alert_source FROM ml_features").fetchone()[0]
+        row = conn.execute(
+            "SELECT alert_source, score_total, score_setup, entry_risk_penalty FROM ml_features"
+        ).fetchone()
         conn.close()
-        self.assertEqual(source, "pool")
+        self.assertEqual(row, ("pool", 72.0, 91.0, 19.0))
 
 
 if __name__ == "__main__":
