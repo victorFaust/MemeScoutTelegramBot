@@ -127,6 +127,45 @@ def _record_calls(count: int = 1) -> None:
 def _safe_float(val) -> float | None:
     if val is None:
         return None
+
+
+def _model_features(score_result: dict, pair: dict, safety_data: dict | None,
+                    alert_source: str) -> dict:
+    """Build a live feature row with the same semantics as feature_logger."""
+    breakdown = score_result.get("breakdown", {})
+    liquidity = (pair.get("liquidity") or {}).get("usd", 0) or 0
+    volume = pair.get("volume") or {}
+    txns = (pair.get("txns") or {}).get("h1") or {}
+    buys = txns.get("buys", 0) or 0
+    sells = txns.get("sells", 0) or 0
+    created = pair.get("pairCreatedAt")
+    age = ((time.time() * 1000 - float(created)) / 3_600_000) if created else 0
+    hour = time.gmtime().tm_hour
+    safety = safety_data or {}
+    return {
+        "score_total": score_result.get("score", 0),
+        "score_setup": score_result.get("setup_score", score_result.get("score", 0)),
+        "entry_risk_penalty": score_result.get("entry_risk_penalty", 0),
+        "score_liquidity": breakdown.get("liquidity", 0),
+        "score_market_cap": breakdown.get("market_cap", 0),
+        "score_pair_age": breakdown.get("pair_age", 0),
+        "score_vol_liq": breakdown.get("vol_liq_ratio", 0),
+        "score_price_change": breakdown.get("price_change", 0),
+        "score_buy_sell": breakdown.get("buy_sell_ratio", 0),
+        "score_velocity": breakdown.get("velocity", 0),
+        "liquidity_usd": liquidity, "market_cap": pair.get("marketCap") or pair.get("fdv") or 0,
+        "volume_24h": volume.get("h24", 0) or 0, "volume_1h": volume.get("h1", 0) or 0,
+        "price_change_5m": (pair.get("priceChange") or {}).get("m5", 0) or 0,
+        "price_change_1h": (pair.get("priceChange") or {}).get("h1", 0) or 0,
+        "price_change_6h": (pair.get("priceChange") or {}).get("h6", 0) or 0,
+        "txns_1h_buys": buys, "txns_1h_sells": sells, "pair_age_hours": age,
+        "vol_liq_ratio": (volume.get("h24", 0) or 0) / liquidity if liquidity else 0,
+        "buy_sell_ratio_1h": buys / sells if sells else buys,
+        "rugcheck_score": safety.get("rugcheck_score"), "lp_locked_pct": safety.get("lp_locked_pct", 0),
+        "risk_count": safety.get("risk_count", 0), "hour_utc": hour,
+        "day_of_week": time.gmtime().tm_wday, "is_us_hours": int(14 <= hour <= 21),
+        "alert_source": alert_source, "chain_id": (pair.get("chainId") or "").lower(),
+    }
     try:
         return float(val)
     except (ValueError, TypeError):
@@ -226,25 +265,49 @@ async def _run_chain_cycle(chain_id: str) -> None:
         elif holder_data:
             safety_data = holder_data
 
-        # Get ML pump probability if model is available
+        # Get shadow-model probability if a chronologically validated artifact is available.
+        ml_liquidity = (pair.get("liquidity") or {}).get("usd", 0) or 0
+        ml_volume_24h = (pair.get("volume") or {}).get("h24", 0) or 0
+        ml_buys = ((pair.get("txns") or {}).get("h1") or {}).get("buys", 0) or 0
+        ml_sells = ((pair.get("txns") or {}).get("h1") or {}).get("sells", 0) or 0
+        ml_created = pair.get("pairCreatedAt")
+        ml_age = ((time.time() * 1000 - float(ml_created)) / 3_600_000) if ml_created else 0
+        ml_hour = time.gmtime().tm_hour
         ml_prob = ml_model.predict_pump({
             "score_total": result["score"],
+            "score_setup": result.get("setup_score", result["score"]),
+            "entry_risk_penalty": result.get("entry_risk_penalty", 0),
             **result.get("breakdown", {}),
-            "liquidity_usd": (pair.get("liquidity") or {}).get("usd", 0) or 0,
+            "score_liquidity": result.get("breakdown", {}).get("liquidity", 0),
+            "score_market_cap": result.get("breakdown", {}).get("market_cap", 0),
+            "score_pair_age": result.get("breakdown", {}).get("pair_age", 0),
+            "score_vol_liq": result.get("breakdown", {}).get("vol_liq_ratio", 0),
+            "score_price_change": result.get("breakdown", {}).get("price_change", 0),
+            "score_buy_sell": result.get("breakdown", {}).get("buy_sell_ratio", 0),
+            "score_velocity": result.get("breakdown", {}).get("velocity", 0),
+            "liquidity_usd": ml_liquidity,
             "market_cap": pair.get("marketCap") or pair.get("fdv") or 0,
-            "volume_24h": (pair.get("volume") or {}).get("h24", 0) or 0,
+            "volume_24h": ml_volume_24h,
             "volume_1h": (pair.get("volume") or {}).get("h1", 0) or 0,
             "price_change_5m": (pair.get("priceChange") or {}).get("m5", 0) or 0,
             "price_change_1h": (pair.get("priceChange") or {}).get("h1", 0) or 0,
             "price_change_6h": (pair.get("priceChange") or {}).get("h6", 0) or 0,
-            "txns_1h_buys": ((pair.get("txns") or {}).get("h1") or {}).get("buys", 0) or 0,
-            "txns_1h_sells": ((pair.get("txns") or {}).get("h1") or {}).get("sells", 0) or 0,
+            "txns_1h_buys": ml_buys,
+            "txns_1h_sells": ml_sells,
+            "pair_age_hours": ml_age,
+            "vol_liq_ratio": ml_volume_24h / ml_liquidity if ml_liquidity else 0,
+            "buy_sell_ratio_1h": ml_buys / ml_sells if ml_sells else ml_buys,
             "rugcheck_score": safety_data.get("rugcheck_score") if safety_data else None,
             "lp_locked_pct": safety_data.get("lp_locked_pct", 0) if safety_data else 0,
             "risk_count": safety_data.get("risk_count", 0) if safety_data else 0,
-        })
+            "hour_utc": ml_hour,
+            "day_of_week": time.gmtime().tm_wday,
+            "is_us_hours": int(14 <= ml_hour <= 21),
+            "alert_source": "scan",
+            "chain_id": chain,
+        }, alert_source="scan")
         if ml_prob is not None:
-            logger.info("[ML] $%s pump probability: %.0f%%", base.get("symbol", "?"), ml_prob * 100)
+            logger.info("[ML] $%s shadow P(+10%% at 1h): %.0f%%", base.get("symbol", "?"), ml_prob * 100)
             result["ml_prob"] = ml_prob
 
         calibration = score_calibration.calibrate("scan", result["score"], chain)
@@ -365,8 +428,12 @@ async def _handle_new_pool(token_info: dict) -> None:
 
     pool_score_result = filters.score_pair(pair, cfg)
     pool_calibration = score_calibration.calibrate("pool", pool_score_result["score"], chain_id)
+    pool_ml_prob = ml_model.predict_pump(
+        _model_features(pool_score_result, pair, rc_data, "pool"), alert_source="pool"
+    )
     token_info["score_result"] = pool_score_result
     token_info["calibration"] = pool_calibration
+    token_info["ml_prob"] = pool_ml_prob
 
     # Send alert
     ok = await tg.send_new_pool_alert(token_info, rc_data)
@@ -484,6 +551,9 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
     safety_data = rc_data or {}
     if holder_data:
         safety_data.update(holder_data)
+    wallet_ml_prob = ml_model.predict_pump(
+        _model_features(wallet_score_result, pair, safety_data, "wallet"), alert_source="wallet"
+    )
 
     # Get wallet info for the alert
     wallets = wallet_tracker.get_tracked_wallets()
@@ -511,6 +581,8 @@ async def _handle_wallet_buy(wallet_address: str, token_address: str, confidence
            if wallet_score_result.get("entry_risk_penalty") else "\n")
         + f"Historical 1h win: {wallet_calibration['probability']*100:.0f}% | "
           f"expectancy {wallet_calibration['expectancy_pct']:+.1f}% (n={wallet_calibration['samples']})\n"
+        + (f"Shadow model P(+10% at 1h): {wallet_ml_prob*100:.0f}% (advisory)\n"
+           if wallet_ml_prob is not None else "")
     )
 
     if safety_data:

@@ -194,6 +194,8 @@ def build_message(result: dict, safety: dict | None = None) -> str:
             f"\U0001f3af Historical 1h win: *{probability:.0f}%* | expectancy {expectancy:+.1f}% "
             f"(n={samples}, {evidence})"
         )
+    if result.get("ml_prob") is not None:
+        lines.append(f"\U0001f9e0 Shadow model P(+10% at 1h): *{result['ml_prob']*100:.0f}%* (advisory only)")
 
     if dex_url:
         lines.append(f"[View on DexScreener]({dex_url})")
@@ -310,6 +312,10 @@ async def send_new_pool_alert(token_info: dict, rc_data: dict | None = None) -> 
         lines.append(
             f"\U0001f3af Historical 1h win: *{calibration['probability']*100:.0f}%* | "
             f"expectancy {calibration['expectancy_pct']:+.1f}% (n={calibration['samples']})"
+        )
+    if token_info.get("ml_prob") is not None:
+        lines.append(
+            f"\U0001f9e0 Shadow model P(+10% at 1h): *{token_info['ml_prob']*100:.0f}%* (advisory only)"
         )
 
     lines.append("")

@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS ml_features (
     price_24h           REAL,
     max_price_24h       REAL,
     rugged              INTEGER DEFAULT 0,
+    rug_verified        INTEGER DEFAULT 0,
     outcome_label       TEXT,
 
     UNIQUE(token_address, chain_id, alerted_at)
@@ -102,9 +103,10 @@ def _connect() -> sqlite3.Connection:
             "ALTER TABLE ml_features ADD COLUMN alert_source TEXT NOT NULL DEFAULT 'legacy'"
         )
         conn.commit()
-    for name in ("score_setup", "entry_risk_penalty"):
+    for name, definition in (("score_setup", "REAL"), ("entry_risk_penalty", "REAL"),
+                             ("rug_verified", "INTEGER DEFAULT 0")):
         if name not in columns:
-            conn.execute(f"ALTER TABLE ml_features ADD COLUMN {name} REAL")
+            conn.execute(f"ALTER TABLE ml_features ADD COLUMN {name} {definition}")
             conn.commit()
     return conn
 
@@ -258,7 +260,8 @@ def mark_rugged(token_address: str, chain_id: str) -> None:
     conn = _connect()
     try:
         conn.execute(
-            "UPDATE ml_features SET rugged = 1, outcome_label = 'rug' WHERE token_address = ? AND chain_id = ?",
+            """UPDATE ml_features SET rugged = 1, rug_verified = 1, outcome_label = 'rug'
+               WHERE token_address = ? AND chain_id = ?""",
             (token_address, chain_id),
         )
         conn.commit()

@@ -123,6 +123,8 @@ The displayed entry score is the weighted setup score minus late-entry risk pena
 
 Autonomous copy-buys fail closed unless their historical wallet-alert cohort has at least `AUTO_BUY_MIN_CALIBRATION_SAMPLES`, meets `AUTO_BUY_MIN_CALIBRATED_PROB`, and has expectancy above `AUTO_BUY_MIN_EXPECTANCY_PCT`. Manual buy buttons remain available for review even when auto-buy is blocked.
 
+The `/model` shadow dashboard evaluates `P(return >= +10% at 1h)` using chronological 60/20/20 train/calibration/test splits. It reports precision, recall, Brier score, predicted-trade expectancy net of `ML_ESTIMATED_TRADING_COST_PCT`, and maximum drawdown. Chain- and source-specific models are trained only when their datasets are sufficiently large; model output remains advisory.
+
 ## Safety Check (GoPlus API)
 
 After scoring, each token is checked against the GoPlus Security API:
