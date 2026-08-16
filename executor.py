@@ -352,7 +352,8 @@ def get_sell_quote(token_mint: str, token_amount: int) -> dict | None:
         return None
 
 
-def execute_swap(quote: dict, wallet_address: str | None = None) -> dict | None:
+def execute_swap(quote: dict, wallet_address: str | None = None,
+                 telemetry: dict[str, Any] | None = None) -> dict | None:
     """Execute a swap via Jito bundle (MEV-protected), falling back to regular RPC.
 
     Uses round-robin across the wallet pool to reduce on-chain fingerprinting.
@@ -387,6 +388,7 @@ def execute_swap(quote: dict, wallet_address: str | None = None) -> dict | None:
     fee_setting: Any = {"jitoTipLamports": jito_tip} if mev_enabled else priority
 
     # Get swap transaction from Jupiter
+    build_started = time.perf_counter()
     try:
         resp = requests.post(JUPITER_SWAP_URL, json={
             "quoteResponse": quote,
@@ -398,14 +400,23 @@ def execute_swap(quote: dict, wallet_address: str | None = None) -> dict | None:
         resp.raise_for_status()
         swap_data = resp.json()
     except requests.RequestException as e:
+        if telemetry is not None:
+            telemetry.update(failure_stage="build", error=str(e),
+                             build_ms=(time.perf_counter() - build_started) * 1000)
         logger.error("[TRADE] Jupiter swap request failed: %s", e)
         return None
 
+    if telemetry is not None:
+        telemetry["build_ms"] = (time.perf_counter() - build_started) * 1000
+
     if "error" in swap_data:
+        if telemetry is not None:
+            telemetry.update(failure_stage="build", error=str(swap_data["error"]))
         logger.error("[TRADE] Jupiter swap error: %s", swap_data["error"])
         return None
 
     # Deserialize and sign the transaction
+    sign_started = time.perf_counter()
     try:
         swap_tx_base64 = swap_data.get("swapTransaction")
         if not swap_tx_base64:
@@ -419,13 +430,23 @@ def execute_swap(quote: dict, wallet_address: str | None = None) -> dict | None:
         signed_b64 = base64.b64encode(signed_bytes).decode("utf-8")
 
     except Exception as e:
+        if telemetry is not None:
+            telemetry.update(failure_stage="sign", error=str(e),
+                             sign_ms=(time.perf_counter() - sign_started) * 1000)
         logger.error("[TRADE] Transaction signing failed: %s", e)
         return None
 
+    if telemetry is not None:
+        telemetry["sign_ms"] = (time.perf_counter() - sign_started) * 1000
+
     # Try Jito bundle first (MEV-protected)
+    submit_started = time.perf_counter()
     if mev_enabled:
         result = _submit_jito_bundle(signed_b64)
         if result:
+            if telemetry is not None:
+                telemetry.update(submit_ms=(time.perf_counter() - submit_started) * 1000,
+                                 submit_provider="jito")
             result["wallet_address"] = wallet_address
             return result
 
@@ -433,8 +454,23 @@ def execute_swap(quote: dict, wallet_address: str | None = None) -> dict | None:
     logger.info("[TRADE] Jito bundle failed, falling back to regular RPC")
     result = _submit_rpc(signed_b64)
     if result:
+        if telemetry is not None:
+            telemetry.update(submit_ms=(time.perf_counter() - submit_started) * 1000,
+                             submit_provider="rpc")
         result["wallet_address"] = wallet_address
+    elif telemetry is not None:
+        telemetry.update(failure_stage="submit", error="all submission paths failed",
+                         submit_ms=(time.perf_counter() - submit_started) * 1000)
     return result
+
+
+def _quote_route(quote: dict) -> str:
+    labels: list[str] = []
+    for step in quote.get("routePlan", []) or []:
+        label = ((step.get("swapInfo") or {}).get("label"))
+        if label and label not in labels:
+            labels.append(label)
+    return " > ".join(labels)[:200] or "Jupiter"
 
 
 def can_trade() -> tuple[bool, str]:
@@ -502,22 +538,46 @@ def buy_token(token_mint: str, amount_sol: float | None = None) -> dict | None:
     buy_wallet = str(pool[_wallet_index % len(pool)].pubkey())
     _wallet_index += 1
     profile = storage.get_wallet_profile(buy_wallet)
+    attempt_id = storage.create_execution_attempt("buy", token_mint, buy_wallet)
 
     # Get quote using the selected wallet's execution profile.
+    quote_started = time.perf_counter()
     quote = get_quote(token_mint, amount_sol, int(profile.get("slippage_bps", config.TRADE_SLIPPAGE_BPS)))
+    quote_ms = (time.perf_counter() - quote_started) * 1000
     if quote is None:
+        storage.update_execution_attempt(
+            attempt_id, quote_ms=quote_ms, status="failed", failure_stage="quote",
+            error="quote unavailable",
+        )
         return None
 
     # Check price impact
     price_impact = float(quote.get("priceImpactPct", "0") or "0")
     if price_impact > 10.0:  # >10% price impact = too thin liquidity
+        storage.update_execution_attempt(
+            attempt_id, quote_ms=quote_ms, expected_out=int(quote.get("outAmount", 0) or 0),
+            price_impact_pct=price_impact, route=_quote_route(quote), status="blocked",
+            failure_stage="risk", error="price impact above 10%",
+        )
         logger.warning("[TRADE] Buy blocked: price impact too high (%.1f%%)", price_impact)
         return None
 
     # Execute
-    result = execute_swap(quote, wallet_address=buy_wallet)
+    telemetry: dict[str, Any] = {}
+    result = execute_swap(quote, wallet_address=buy_wallet, telemetry=telemetry)
     if result is None:
+        storage.update_execution_attempt(
+            attempt_id, quote_ms=quote_ms, expected_out=int(quote.get("outAmount", 0) or 0),
+            price_impact_pct=price_impact, route=_quote_route(quote), status="failed",
+            **telemetry,
+        )
         return None
+
+    storage.update_execution_attempt(
+        attempt_id, quote_ms=quote_ms, expected_out=int(quote.get("outAmount", 0) or 0),
+        price_impact_pct=price_impact, route=_quote_route(quote), status="submitted",
+        submitted_at=time.time(), signature=result.get("signature", ""), **telemetry,
+    )
 
     # Track spending
     _daily_spent_sol += amount_sol
@@ -591,18 +651,28 @@ def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | N
         owner_wallet = position.get("wallet_address") or get_wallet_address()
         profile = storage.get_wallet_profile(owner_wallet or "")
         base_slippage = int(profile.get("slippage_bps", config.TRADE_SLIPPAGE_BPS))
+        attempt_id = storage.create_execution_attempt("sell", token_mint, owner_wallet or "", position_id)
+        quote_ms = 0.0
+        telemetry: dict[str, Any] = {}
         # Try sell with normal slippage, then retry with higher if it fails
         for attempt, slippage_mult in enumerate([1.0, 2.0, 3.0], 1):
             extra_bps = min(5000, int(base_slippage * slippage_mult))
+            quote_started = time.perf_counter()
             quote = _get_sell_quote_with_slippage(token_mint, token_amount, extra_bps)
+            quote_ms += (time.perf_counter() - quote_started) * 1000
             if quote is None:
                 if attempt < 3:
                     logger.warning("[TRADE] Sell quote failed (attempt %d/3), retrying with higher slippage", attempt)
                     time.sleep(1)
                     continue
+                storage.update_execution_attempt(
+                    attempt_id, quote_ms=quote_ms, status="failed", failure_stage="quote",
+                    error="sell quote unavailable after retries",
+                )
                 return None
 
-            result = execute_swap(quote, wallet_address=owner_wallet)
+            telemetry = {}
+            result = execute_swap(quote, wallet_address=owner_wallet, telemetry=telemetry)
             if result is not None:
                 if attempt > 1:
                     logger.info("[TRADE] Sell succeeded on attempt %d with %d bps slippage", attempt, extra_bps)
@@ -612,10 +682,20 @@ def sell_token(position_id: int, token_mint: str, token_amount: int) -> dict | N
                 logger.warning("[TRADE] Sell swap failed (attempt %d/3), retrying with higher slippage", attempt)
                 time.sleep(1)
         else:
+            storage.update_execution_attempt(
+                attempt_id, quote_ms=quote_ms, status="failed", route=_quote_route(quote),
+                expected_out=int(quote.get("outAmount", 0) or 0), **telemetry,
+            )
             logger.error("[TRADE] Sell failed after 3 attempts for %s", token_mint[:16])
             return None
 
         sol_received = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL
+        storage.update_execution_attempt(
+            attempt_id, quote_ms=quote_ms, expected_out=int(quote.get("outAmount", 0) or 0),
+            price_impact_pct=float(quote.get("priceImpactPct", 0) or 0), route=_quote_route(quote),
+            status="submitted", submitted_at=time.time(), signature=result.get("signature", ""),
+            **telemetry,
+        )
         storage.close_position(position_id, sol_received, result["signature"])
         completed = True
         result["sol_received"] = sol_received
@@ -649,14 +729,32 @@ def sell_partial(position_id: int, token_mint: str, token_amount: int, sell_pct:
         position = storage.get_position_by_id(position_id) or {}
         owner_wallet = position.get("wallet_address") or get_wallet_address()
         profile = storage.get_wallet_profile(owner_wallet or "")
+        attempt_id = storage.create_execution_attempt("sell", token_mint, owner_wallet or "", position_id)
+        quote_started = time.perf_counter()
         quote = _get_sell_quote_with_slippage(
             token_mint, sell_amount, int(profile.get("slippage_bps", config.TRADE_SLIPPAGE_BPS))
         )
+        quote_ms = (time.perf_counter() - quote_started) * 1000
         if quote is None:
+            storage.update_execution_attempt(
+                attempt_id, quote_ms=quote_ms, status="failed", failure_stage="quote",
+                error="partial sell quote unavailable",
+            )
             return None
-        result = execute_swap(quote, wallet_address=owner_wallet)
+        telemetry: dict[str, Any] = {}
+        result = execute_swap(quote, wallet_address=owner_wallet, telemetry=telemetry)
         if result is None:
+            storage.update_execution_attempt(
+                attempt_id, quote_ms=quote_ms, expected_out=int(quote.get("outAmount", 0) or 0),
+                route=_quote_route(quote), status="failed", **telemetry,
+            )
             return None
+        storage.update_execution_attempt(
+            attempt_id, quote_ms=quote_ms, expected_out=int(quote.get("outAmount", 0) or 0),
+            price_impact_pct=float(quote.get("priceImpactPct", 0) or 0), route=_quote_route(quote),
+            status="submitted", submitted_at=time.time(), signature=result.get("signature", ""),
+            **telemetry,
+        )
         sol_received = int(quote.get("outAmount", "0") or "0") / LAMPORTS_PER_SOL
         remaining = token_amount - sell_amount
         storage.update_position_tokens(position_id, remaining)
@@ -777,4 +875,30 @@ def get_confirmed_token_delta(signature: str, wallet_address: str, token_mint: s
         return max(0, delta)
     except Exception as e:
         logger.warning("[TRADE] Transaction token-delta lookup failed: %s", e)
+        return None
+
+
+def get_confirmed_sol_delta(signature: str, wallet_address: str) -> int | None:
+    """Return the confirmed wallet SOL increase in lamports for a sell."""
+    try:
+        import rpc_client
+        tx = rpc_client.rpc_call(
+            "getTransaction",
+            [signature, {"encoding": "jsonParsed", "commitment": "confirmed",
+                         "maxSupportedTransactionVersion": 0}],
+            preferred_name="Alchemy",
+        )
+        if not tx or not tx.get("meta") or tx["meta"].get("err") is not None:
+            return None
+        message = ((tx.get("transaction") or {}).get("message") or {})
+        keys = [item.get("pubkey", "") if isinstance(item, dict) else str(item)
+                for item in message.get("accountKeys", [])]
+        wallet_index = keys.index(wallet_address)
+        pre = tx["meta"].get("preBalances", [])
+        post = tx["meta"].get("postBalances", [])
+        if wallet_index >= len(pre) or wallet_index >= len(post):
+            return None
+        return max(0, int(post[wallet_index]) - int(pre[wallet_index]))
+    except Exception as e:
+        logger.warning("[TRADE] Transaction SOL-delta lookup failed: %s", e)
         return None

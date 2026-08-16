@@ -129,6 +129,35 @@ CREATE TABLE IF NOT EXISTS wallet_profiles (
     buy_presets_usd TEXT NOT NULL DEFAULT '1,2,3,5',
     updated_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS execution_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    side TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    wallet_address TEXT,
+    position_id INTEGER,
+    started_at REAL NOT NULL,
+    quote_ms REAL,
+    build_ms REAL,
+    sign_ms REAL,
+    submit_ms REAL,
+    submitted_at REAL,
+    confirmation_ms REAL,
+    confirmed_at REAL,
+    expected_out INTEGER,
+    realized_out INTEGER,
+    price_impact_pct REAL,
+    route TEXT,
+    submit_provider TEXT,
+    signature TEXT,
+    status TEXT NOT NULL DEFAULT 'started',
+    failure_stage TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_execution_attempts_started
+ON execution_attempts(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_attempts_pending
+ON execution_attempts(status, submitted_at);
 """
 
 
@@ -834,6 +863,72 @@ def update_wallet_profile(wallet_address: str, **settings: Any) -> dict:
         finally:
             conn.close()
     return get_wallet_profile(wallet_address)
+
+
+# -- Execution telemetry --
+
+def create_execution_attempt(side: str, token_address: str, wallet_address: str = "",
+                             position_id: int | None = None) -> int:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """INSERT INTO execution_attempts
+               (side, token_address, wallet_address, position_id, started_at, status)
+               VALUES (?, ?, ?, ?, ?, 'started')""",
+            (side, token_address, wallet_address, position_id, time.time()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def update_execution_attempt(attempt_id: int, **values: Any) -> None:
+    allowed = {
+        "wallet_address", "quote_ms", "build_ms", "sign_ms", "submit_ms",
+        "submitted_at", "confirmation_ms", "confirmed_at", "expected_out",
+        "realized_out", "price_impact_pct", "route", "submit_provider",
+        "signature", "status", "failure_stage", "error",
+    }
+    updates = {key: value for key, value in values.items() if key in allowed}
+    if not updates:
+        return
+    conn = _connect()
+    try:
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        conn.execute(
+            f"UPDATE execution_attempts SET {assignments} WHERE id = ?",
+            (*updates.values(), attempt_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_execution_attempts() -> list[dict]:
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute(
+            """SELECT * FROM execution_attempts
+               WHERE status IN ('submitted', 'unconfirmed') AND signature IS NOT NULL
+               ORDER BY submitted_at ASC"""
+        ).fetchall()]
+    finally:
+        conn.close()
+
+
+def get_execution_attempts_since(since_ts: float, limit: int = 500) -> list[dict]:
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute(
+            """SELECT * FROM execution_attempts WHERE started_at >= ?
+               ORDER BY started_at DESC LIMIT ?""",
+            (since_ts, limit),
+        ).fetchall()]
+    finally:
+        conn.close()
 
 
 # -- Watchlist --
