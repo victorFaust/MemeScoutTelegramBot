@@ -161,6 +161,14 @@ CREATE INDEX IF NOT EXISTS idx_execution_attempts_started
 ON execution_attempts(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_execution_attempts_pending
 ON execution_attempts(status, submitted_at);
+
+CREATE TABLE IF NOT EXISTS model_evaluations (
+    trained_at REAL NOT NULL,
+    cohort TEXT NOT NULL,
+    recorded_at REAL NOT NULL,
+    metrics_json TEXT NOT NULL,
+    PRIMARY KEY (trained_at, cohort)
+);
 """
 
 
@@ -958,6 +966,43 @@ def get_execution_attempts_since(since_ts: float, limit: int = 500) -> list[dict
                ORDER BY started_at DESC LIMIT ?""",
             (since_ts, limit),
         ).fetchall()]
+    finally:
+        conn.close()
+
+
+def save_model_evaluations(trained_at: float, metrics: dict[str, dict]) -> None:
+    """Persist immutable forward-test metrics for progress comparisons."""
+    conn = _connect()
+    try:
+        conn.executemany(
+            """INSERT OR IGNORE INTO model_evaluations
+               (trained_at, cohort, recorded_at, metrics_json) VALUES (?, ?, ?, ?)""",
+            [(trained_at, cohort, time.time(), json.dumps(values))
+             for cohort, values in metrics.items()],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_model_evaluation_runs(limit: int = 2) -> list[dict]:
+    """Return newest evaluation runs with all cohort metrics."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        run_times = [row[0] for row in conn.execute(
+            "SELECT DISTINCT trained_at FROM model_evaluations ORDER BY trained_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()]
+        runs = []
+        for trained_at in run_times:
+            rows = conn.execute(
+                "SELECT cohort, metrics_json FROM model_evaluations WHERE trained_at = ?",
+                (trained_at,),
+            ).fetchall()
+            runs.append({"trained_at": trained_at,
+                         "metrics": {row["cohort"]: json.loads(row["metrics_json"]) for row in rows}})
+        return runs
     finally:
         conn.close()
 

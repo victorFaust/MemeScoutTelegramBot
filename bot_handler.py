@@ -72,6 +72,7 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📜 History", callback_data="menu:trades")],
         [InlineKeyboardButton("⏱ Execution", callback_data="menu:execution"),
          InlineKeyboardButton("🧠 Model", callback_data="menu:model")],
+        [InlineKeyboardButton("🎯 Prediction Progress", callback_data="menu:progress")],
         [InlineKeyboardButton("🤖 Auto-Buy: " + ("ON" if config.AUTO_BUY_ENABLED else "OFF"), callback_data="menu:autobuy"),
          InlineKeyboardButton("🚨 Stop", callback_data="menu:stop")],
     ])
@@ -144,6 +145,8 @@ async def _handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await _show_execution(query)
     elif action == "model":
         await _show_model(query)
+    elif action == "progress":
+        await _show_progress(query)
     elif action == "trades":
         await _show_trades(query)
     elif action.startswith("trade_"):
@@ -366,6 +369,28 @@ async def _handle_model_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Not authorized")
         return
     await update.message.reply_text(_model_report())
+
+
+async def _show_progress(query) -> None:
+    import progress_report
+    await query.edit_message_text(progress_report.build(7), reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Refresh", callback_data="menu:progress"),
+        InlineKeyboardButton("⬅️ Dashboard", callback_data="menu:back"),
+    ]]))
+
+
+async def _handle_progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_authorized(update):
+        await update.message.reply_text("Not authorized")
+        return
+    try:
+        days = max(1, min(30, int(context.args[0]))) if context.args else 7
+    except ValueError:
+        days = 7
+    import progress_report
+    await update.message.reply_text(progress_report.build(days))
 
 
 async def _send_positions(target, text: str, reply_markup) -> None:
@@ -1957,6 +1982,7 @@ async def start_bot_handler() -> None:
         BotCommand("cancelorder", "Cancel order: /cancelorder <id>"),
         BotCommand("profile", "Configure wallet execution profile"),
         BotCommand("execution", "Execution quality: /execution [days]"),
+        BotCommand("progress", "Prediction readiness: /progress [days]"),
         BotCommand("model", "Shadow prediction model metrics"),
         BotCommand("watch", "Watch token: /watch <address>"),
         BotCommand("wallets", "View tracked wallets"),
@@ -1981,6 +2007,7 @@ async def start_bot_handler() -> None:
     app.add_handler(CommandHandler("profile", _handle_profile_command))
     app.add_handler(CommandHandler("execution", _handle_execution_command))
     app.add_handler(CommandHandler("model", _handle_model_command))
+    app.add_handler(CommandHandler("progress", _handle_progress_command))
     app.add_handler(CommandHandler("watch", _handle_watch_command))
     app.add_handler(CommandHandler("addwallet", _handle_addwallet_command))
     app.add_handler(CommandHandler("wallets", _handle_wallets_command))

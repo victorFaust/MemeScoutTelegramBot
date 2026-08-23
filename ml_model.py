@@ -195,6 +195,11 @@ def train() -> dict:
         _models = fitted
         _metadata = metadata
         _model_loaded_at = trained_at
+        try:
+            import storage
+            storage.save_model_evaluations(trained_at, metadata["metrics"])
+        except Exception:
+            logger.exception("[ML] Failed to persist evaluation history")
         logger.info("[ML] Shadow models trained: %s", ", ".join(fitted))
         return {"status": "trained", "models": list(fitted), **metadata}
     except ImportError:
