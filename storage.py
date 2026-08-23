@@ -372,6 +372,21 @@ def update_snapshot(
         conn.close()
 
 
+def mark_snapshot_missed(row_id: int, window: str) -> None:
+    """Close an expired snapshot without inventing a historical price."""
+    if window not in {"15m", "1h", "6h", "24h"}:
+        raise ValueError(f"Unsupported snapshot window: {window}")
+    conn = _connect()
+    try:
+        conn.execute(
+            f"UPDATE alert_outcomes SET checked_{window} = 1 WHERE id = ?",
+            (row_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_outcomes_for_report(days: int = 7) -> list[dict]:
     """Get all outcome rows from the last N days for reporting."""
     cutoff = time.time() - days * 86400
