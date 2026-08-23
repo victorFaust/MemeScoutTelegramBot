@@ -21,6 +21,16 @@ WINDOWS = [
     ("24h", 24 * 3600),
 ]
 
+# A price fetched long after a checkpoint is not a historical observation.
+# Close stale windows as missing so a restart cannot make every horizon use the
+# same current price. The tracker normally runs every five minutes.
+MAX_LATENESS = {
+    "15m": 15 * 60,
+    "1h": 30 * 60,
+    "6h": 60 * 60,
+    "24h": 2 * 60 * 60,
+}
+
 # Grace period: don't check until at least this many seconds after the due time
 _GRACE_SECONDS = 60
 _RUG_CONFIRM_THRESHOLD = 3
@@ -79,7 +89,7 @@ def run_snapshot_check() -> dict[str, int]:
     """
     now = time.time()
     pending = storage.get_pending_snapshots()
-    stats = {"checked": 0, "updated": 0, "rugged": 0, "errors": 0}
+    stats = {"checked": 0, "updated": 0, "missed": 0, "rugged": 0, "errors": 0}
 
     logger.info("Snapshot check: %d pending outcomes to evaluate", len(pending))
 
@@ -95,7 +105,16 @@ def run_snapshot_check() -> dict[str, int]:
         for window_name, delay in WINDOWS:
             checked_col = f"checked_{window_name}"
             if not row.get(checked_col) and (now - alerted_at) >= (delay + _GRACE_SECONDS):
-                windows_due.append(window_name)
+                lateness = now - alerted_at - delay
+                if lateness > MAX_LATENESS[window_name]:
+                    storage.mark_snapshot_missed(row_id, window_name)
+                    stats["missed"] += 1
+                    logger.info(
+                        "Expired %s snapshot for %s (late by %.0fm)",
+                        window_name, row.get("token_symbol", "?"), lateness / 60,
+                    )
+                else:
+                    windows_due.append(window_name)
 
         if not windows_due:
             continue
@@ -157,7 +176,7 @@ def run_snapshot_check() -> dict[str, int]:
             stats["errors"] += 1
 
     logger.info(
-        "Snapshot check complete: checked=%d, updated=%d, rugged=%d, errors=%d",
-        stats["checked"], stats["updated"], stats["rugged"], stats["errors"],
+        "Snapshot check complete: checked=%d, updated=%d, missed=%d, rugged=%d, errors=%d",
+        stats["checked"], stats["updated"], stats["missed"], stats["rugged"], stats["errors"],
     )
     return stats

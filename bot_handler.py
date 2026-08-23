@@ -722,6 +722,7 @@ async def _show_wallet(query) -> None:
          if tracker.get("last_latency_ms") is not None else "Last event processing: waiting"),
         "",
     ]
+
     if len(all_wallets) > 1:
         lines.append(f"Multi-wallet mode ({len(all_wallets)} wallets, round-robin):")
         for i, addr in enumerate(all_wallets):
@@ -1488,6 +1489,21 @@ async def _handle_pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("\n".join(lines))
 
 
+def _outcome_coverage(rows: list[dict], window: str, now: float) -> tuple[int, int]:
+    """Return valid and matured sample counts for a report horizon."""
+    horizon_seconds = {"15m": 15 * 60, "1h": 3600, "6h": 6 * 3600, "24h": 24 * 3600}
+    matured = sum(
+        1 for row in rows
+        if now - float(row.get("alerted_at") or now) >= horizon_seconds[window]
+    )
+    valid = sum(
+        1 for row in rows
+        if row.get(f"checked_{window}") and row.get(f"price_{window}")
+        and row.get("price_at_alert")
+    )
+    return valid, matured
+
+
 async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /report [days] — send performance report to Telegram."""
     if not update.message:
@@ -1549,12 +1565,19 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
         f"Alerts: {total} | Rugged: {rugged} ({rug_rate:.0f}%)",
         "",
     ]
+    now = time.time()
 
     # Win rates by timeframe
     for window in ["15m", "1h", "6h", "24h"]:
         n, wr, avg, mx = _stats(window)
+        _, matured = _outcome_coverage(rows, window, now)
         if n > 0:
-            lines.append(f"  {window}: {wr} win ({n}) | avg {avg} | best {mx}")
+            coverage = n / matured * 100 if matured else 0
+            lines.append(
+                f"  {window}: {wr} win ({n}/{matured}, {coverage:.0f}% coverage) | avg {avg} | best {mx}"
+            )
+        elif matured:
+            lines.append(f"  {window}: no valid prices (0/{matured}, 0% coverage)")
 
     # Top gainers at 1h
     gainers = []
@@ -1632,9 +1655,12 @@ async def _handle_report_command(update: Update, context: ContextTypes.DEFAULT_T
         ):
             cal = score_calibration.calibrate(source, score, "solana")
             state = "✅ trade" if cal["eligible"] else "⛔ no auto-buy"
-            calibration_lines.append(
-                f"  {label}: {cal['probability']*100:.0f}% win | exp {cal['expectancy_pct']:+.1f}% | n={cal['samples']} | {state}"
-            )
+            if cal["samples"]:
+                calibration_lines.append(
+                    f"  {label}: {cal['probability']*100:.0f}% win | exp {cal['expectancy_pct']:+.1f}% | n={cal['samples']} | {state}"
+                )
+            else:
+                calibration_lines.append(f"  {label}: insufficient data | n=0 | {state}")
         lines += ["", "🎯 CALIBRATION (+10% AT 1H)"] + calibration_lines
     except Exception:
         logger.exception("[BOT] Calibration report failed")
