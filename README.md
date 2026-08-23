@@ -125,6 +125,8 @@ Autonomous copy-buys fail closed unless their historical wallet-alert cohort has
 
 The `/model` shadow dashboard evaluates `P(return >= +10% at 1h)` using chronological 60/20/20 train/calibration/test splits. It reports precision, recall, Brier score, predicted-trade expectancy net of `ML_ESTIMATED_TRADING_COST_PCT`, and maximum drawdown. Chain- and source-specific models are trained only when their datasets are sufficiently large; model output remains advisory.
 
+The `/progress [days]` dashboard combines mature 1h outcome coverage, forward model gates, source-specific performance, prior evaluation-run comparison, and execution readiness. A model becomes a candidate only after every model gate passes in two consecutive untouched forward periods; promotion remains manual.
+
 ## Safety Check (GoPlus API)
 
 After scoring, each token is checked against the GoPlus Security API:
